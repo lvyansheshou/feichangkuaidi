@@ -507,12 +507,24 @@ class DecisionEngine:
     def _check_bounty(self, world, node_id):
         """检查节点是否有可结算的破关悬赏。
 
-        返回悬赏分值（0=无悬赏）。关键关隘 18 分，普通 10 分。
+        优先读取协议字段 rewardScore（精确值），回退到类型推断。
         """
         for b in (world.bounties or []):
-            if b.get("nodeId") == node_id and not b.get("claimed"):
-                btype = b.get("type", "")
-                return 18 if btype == "KEY_BOUNTY" else 10
+            if b.get("nodeId") != node_id:
+                continue
+            if b.get("completed") or not b.get("active"):
+                continue
+            # 冷却中 → 不可结算
+            cooldown = b.get("cooldownUntilRound", 0) or 0
+            if cooldown > (world.round or 0):
+                continue
+            # 优先用协议精确值
+            reward = b.get("rewardScore", 0) or 0
+            if reward > 0:
+                return reward
+            # 回退类型推断
+            btype = b.get("bountyType", "")
+            return 18 if btype == "KEY_BOUNTY" else 10
         return 0
 
     def _active_bounty_hunt(self, world, me, gm, node, terminal):
@@ -702,8 +714,11 @@ class DecisionEngine:
         return None
 
     def _maybe_task(self, world, me, gm, node, terminal):
-        # 窗口回避：如果对手在同节点，跳过（避免触发 TASK 窗口争夺）
-        if self._opponent_at_same_node(world, node):
+        # ★ 对手忙碌中（处理/验核）→ 不会触发 TASK 窗口 → 可以安全做任务
+        opponent_here = self._opponent_at_same_node(world, node)
+        opponent_busy = self.opponent.is_busy()
+        # 对手在同节点且不忙碌 → 避免触发窗口
+        if opponent_here and not opponent_busy:
             return None
         # 窗口冷却：刚从此节点窗口出来，不重试
         if self._is_window_cooldown(world, node):
@@ -733,6 +748,9 @@ class DecisionEngine:
         if self._is_window_cooldown(world, node):
             return None
 
+        # ★ 对手忙碌中（处理/验核/休整）→ 不会触发窗口 → 可以放心领
+        opponent_busy = self.opponent.is_busy()
+
         ns = world.node(node)
         if ns is None:
             return None
@@ -742,18 +760,18 @@ class DecisionEngine:
         if me.resource_count(ResourceType.ICE_BOX) < config.CLAIM_ICE_BOX_KEEP \
                 and ns.resource_available(ResourceType.ICE_BOX):
             wants.append(ResourceType.ICE_BOX)
-        # 情报：仅对手不在时才领
-        if not opponent_here and me.resource_count(ResourceType.INTEL) < 1 \
+        # 情报：对手不在或对手忙碌时领取
+        if (not opponent_here or opponent_busy) and me.resource_count(ResourceType.INTEL) < 1 \
                 and ns.resource_available(ResourceType.INTEL) \
                 and self._intel_usable_ahead(world, me, gm, node, terminal):
             wants.append(ResourceType.INTEL)
-        # 马：仅在对手不在或我们领先较多时才争
+        # 马：对手忙碌/不在/我们领先时才争
         if not self._has_any_horse(me) and self._far_from_terminal(gm, node, terminal):
             if ns.resource_available(ResourceType.FAST_HORSE):
-                if not opponent_here or self.opponent.posture == "leading":
+                if not opponent_here or opponent_busy or self.opponent.posture == "leading":
                     wants.append(ResourceType.FAST_HORSE)
             elif ns.resource_available(ResourceType.SHORT_HORSE):
-                if not opponent_here or self.opponent.posture == "leading":
+                if not opponent_here or opponent_busy or self.opponent.posture == "leading":
                     wants.append(ResourceType.SHORT_HORSE)
         for r in wants:
             if self._can_afford(world, gm, node, config.RESOURCE_CLAIM_ROUND, terminal):
@@ -1140,34 +1158,38 @@ class DecisionEngine:
         """判断是否应该快速弃权。
 
         弃权条件（任一满足）：
-        1. 我们在竞速/领先态，不值得为资源/任务耗 3+ 帧
-        2. 同一节点已经争过（连续窗口）
-        3. 争夺对象是情报/短程马等低价值资源
+        1. 对手忙碌中（处理/验核）→ 对手被动弃权，我们不用出牌也能赢
+        2. 我们在竞速/领先态，不值得为资源/任务耗 3+ 帧
+        3. 同一节点已经争过（连续窗口）
         """
         ctype = contest.get("contestType")
 
-        # PASS 窗口不能弃权（被迫参战，必须尽力）
-        if ctype == "PASS":
+        # PASS/GATE 不能弃权
+        if ctype in ("PASS", "GATE"):
             return False
 
-        # GATE 窗口不能弃权（宫门验核是关键）
-        if ctype == "GATE":
-            return False
+        # ★ 对手忙碌中（处理/验核/休整）→ 对手被动 ABSTAIN → 我们出 ABSTAIN 也能赢当拍
+        if self.opponent.is_busy():
+            return False  # 必赢，不弃权，但出 ABSTAIN 即可（见 _window_card_fallback）
 
         # 已经在这个节点争了超过 1 轮 → 放弃
         if self._window_rounds >= 3:
             return True
 
-        # 领先/竞速态：资源不值得消耗 3+ 帧窗口时间
+        # 领先/竞速态：资源不值得消耗 3+ 帧
         if self.opponent.posture in ("leading", "racing"):
             if ctype == "RESOURCE":
-                return True  # 让给对手，我们继续赶路
+                return True
 
-        # 落后态：TASK 窗口值得争（追分需要）
-        # RESOURCE/DOCK 让给对手
+        # 落后态：RESOURCE/DOCK 让给对手
         if self.opponent.posture == "trailing":
             if ctype in ("RESOURCE", "DOCK"):
                 return True
+
+        # ★ 分数领先时：非关键窗口弃权
+        score_gap = self.opponent.score_gap(world)
+        if score_gap > 30 and ctype in ("RESOURCE", "DOCK"):
+            return True
 
         return False
 

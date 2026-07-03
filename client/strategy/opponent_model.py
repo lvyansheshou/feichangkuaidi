@@ -95,6 +95,9 @@ class OpponentModel:
         self.guard_action_point = opp.guard_action_point or 0
         self.delivered = opp.delivered
         self.rush_tactic_used = (opp.rush_tactic_used_count or 0) > 0
+        # 缓存对手 buff 类型
+        self._cached_buff_types = {b.get("type") for b in (opp.buffs or [])
+                                   if (b.get("remainingRound", 0) or 0) > 0}
 
         # 资源消耗追踪（累计使用量）
         self.guard_points_used = max(self.guard_points_used,
@@ -271,6 +274,69 @@ class OpponentModel:
     def is_ahead(self):
         """我方是否领先。"""
         return self.lead_frames > 0
+
+    # ── 对手状态深度分析（基于协议 §附录B players 字段）──
+
+    def is_busy(self):
+        """对手是否处于忙碌状态（处理中/验核中/休整中/强制通行中）。
+
+        忙碌时对手无法主动发起资源/任务争夺，只能被动参与 PASS 窗口。
+        → 此时可以安全地 CLAIM_RESOURCE / CLAIM_TASK 而不会触发窗口。
+        """
+        busy_states = {"PROCESSING", "VERIFYING", "RESTING", "FORCED_PASSING"}
+        return self.last_state in busy_states
+
+    def is_moving(self):
+        """对手是否正在移动中。"""
+        return self.last_state == "MOVING"
+
+    def has_buff(self, buff_type):
+        """对手是否有指定类型的增益。"""
+        return buff_type in self._opp_buff_types
+
+    @property
+    def _opp_buff_types(self):
+        """对手当前增益类型集合（从 update 中缓存）。"""
+        return getattr(self, '_cached_buff_types', set())
+
+    def window_card_options(self):
+        """估算对手还能出哪些窗口牌。
+
+        返回可用牌集合，用于判断窗口胜率。
+        """
+        options = {Card.ABSTAIN}
+        if self.guard_action_point > 0:
+            options.add(Card.BING_ZHENG)
+        if self.freshness >= 80 and self.good_fruit > 0:
+            options.add(Card.XIAN_GONG)
+        # 无法知道对手是否有文书/马 → 保守假设有
+        options.add(Card.YAN_DIE)
+        options.add(Card.QIANG_XING)
+        return options
+
+    def is_processing_same_node(self, node_id):
+        """对手是否正在同一节点处理（读条中）。
+
+        如果对手已经在处理，我们的 CLAIM 不会触发窗口（任务书 §5.4.1）。
+        """
+        return (self.last_state == "PROCESSING"
+                and self.last_node == node_id)
+
+    def score_gap(self, world):
+        """从 scorePreview 获取真实分差（正=我方领先）。
+
+        比 ETA-based lead_frames 更直接反映胜负态势。
+        """
+        preview = (world.raw.get("scorePreview") or {} if hasattr(world, 'raw') else {})
+        my_team = None
+        if hasattr(world, 'me') and world.me:
+            my_team = world.me.team_id
+        if not my_team:
+            return 0
+        my_score = preview.get(my_team, 0) or 0
+        opp_team = "BLUE" if my_team == "RED" else "RED"
+        opp_score = preview.get(opp_team, 0) or 0
+        return my_score - opp_score
 
     # ── 窗口牌自适应 ──
 
