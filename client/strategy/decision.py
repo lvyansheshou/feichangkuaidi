@@ -74,6 +74,9 @@ class DecisionEngine:
         # 路径缓存
         self._last_junction = None   # 上次评估路径的岔路口
         self._chosen_path = None     # 选中的路径
+        # 任务追踪
+        self._task_base = 0          # 普通任务基础分累计（不含里程碑）
+        self._completed_task_ids = set()  # 已完成的任务 ID
 
     def decide(self, world):
         me = world.me
@@ -215,8 +218,9 @@ class DecisionEngine:
         return []
 
     def _opportunistic(self, world, me, gm, node, terminal):
-        # ★ 任务天花板：≥90 后只有顺路(≤10帧)才做任务
-        if (me.task_score or 0) < 90 or self._task_is_on_path(world, me, gm, node, terminal):
+        # ★ 任务天花板：task_base ≥ 90 后只在当前节点顺路做
+        task_done = self._task_base >= 90 or (me.task_score or 0) >= 90
+        if not task_done or self._task_is_on_path(world, me, gm, node, terminal):
             task = self._maybe_task(world, me, gm, node, terminal)
             if task:
                 return [task]
@@ -377,7 +381,7 @@ class DecisionEngine:
             return paths[0][0]
 
         posture = self.opponent.posture
-        task_done = (me.task_score or 0) >= 90
+        task_done = (self._task_base >= 90 or (me.task_score or 0) >= 90)
 
         # ★ 对手路径分析：避让对手设卡节点 + 识别对手路线偏好
         opp_visited = {n for n, _ in self.opponent.visited_nodes}
@@ -934,11 +938,17 @@ class DecisionEngine:
     # ---- 绕路做任务（M7）----
 
     def _task_detour_target(self, world, me, gm, node, terminal, extra_budget=0):
-        # ★ 任务天花板：90 分解锁满额送达(240)+用时系数(1.0)+里程碑(+35)
-        #   90→110 只多 15 分里程碑，不值得绕路。≥90 后不做非当前节点任务。
-        current = me.task_score or 0
-        if current >= 90:
-            return None  # 已满 90：只做当前节点任务(_maybe_task)，不绕路
+        # ★ 追踪 task_base（不含里程碑的原始累计）
+        self._track_task_completion(world)
+
+        # 优先用追踪值，回退到服务端 task_score（兼容测试）
+        base = self._task_base
+        if base == 0 and (me.task_score or 0) >= 90:
+            base = me.task_score  # 测试环境：手动设置了 task_score
+
+        # 已满 90：不绕路
+        if base >= 90:
+            return None
         if not terminal:
             return None
 
@@ -947,11 +957,17 @@ class DecisionEngine:
         if direct == _INF:
             return None
 
-        # M8: 里程碑感知动态预算
-        if current < 60:
-            base_budget = config.TASK_DETOUR_MAX_EXTRA_FRAMES       # 70
-        else:  # 60-89
-            base_budget = config.TASK_DETOUR_MAX_EXTRA_FRAMES + 40  # 110（逼近90阈值）
+        # ★ 悬崖效应感知预算：距下一里程碑越近，预算越大
+        if base < 60:
+            gap = 60 - base
+            base_budget = config.TASK_DETOUR_MAX_EXTRA_FRAMES  # 70
+        else:  # 60-89 → 冲刺 90
+            gap = 90 - base
+            base_budget = config.TASK_DETOUR_MAX_EXTRA_FRAMES + 40  # 110
+
+        # ★ 悬崖放大：距里程碑 ≤15 分时，预算翻倍
+        if gap <= 15:
+            base_budget = base_budget * 2  # 最后一个任务的 ROI 远超正常
 
         budget = base_budget + extra_budget
         if budget < 0:
@@ -962,7 +978,8 @@ class DecisionEngine:
             tn = t.get("nodeId")
             if not tn or tn == node:
                 continue
-            if t.get("taskTemplateId") in config.SKIP_TASK_TEMPLATES:
+            tid = t.get("taskTemplateId")
+            if tid in config.SKIP_TASK_TEMPLATES:
                 continue
             prot = t.get("protectionPlayerId") or 0
             if prot and prot != pid:
@@ -976,10 +993,32 @@ class DecisionEngine:
                 continue
             pr = t.get("processRound", 0) or 0
             extra = (c1 + pr + c2) - direct
-            if 0 <= extra <= budget and extra < best_extra \
+            # ★ 30 分任务优先（T01/T02/T08/T11），效率是 15 分任务的 2 倍
+            score = t.get("score", 0) or (30 if tid in ("T01","T02","T04","T06","T08","T11") else 15)
+            # 综合评分：额外帧少 + 分值高 → 更优
+            efficiency = extra - score * 2  # 分值高的任务容忍更多额外帧
+            if 0 <= extra <= budget and efficiency < best_extra \
                     and self._can_afford(world, gm, node, extra, terminal):
-                best, best_extra = tn, extra
+                best, best_extra = tn, efficiency
         return best
+
+    def _track_task_completion(self, world):
+        """追踪已完成任务的基础分累计。
+
+        通过对比 events 中的 TASK_COMPLETE 事件来更新 _task_base。
+        """
+        pid = self.ctx.player_id
+        for e in (world.events or []):
+            if e.get("type") == "TASK_COMPLETE":
+                payload = e.get("payload") or {}
+                if payload.get("playerId") == pid:
+                    tid = payload.get("taskId")
+                    if tid and tid not in self._completed_task_ids:
+                        self._completed_task_ids.add(tid)
+                        # 从任务模板推断分值
+                        template_id = payload.get("taskTemplateId", "")
+                        score = 30 if template_id in ("T01","T02","T04","T06","T08","T11") else 15
+                        self._task_base += score
 
     def _best_on_path_task(self, world, me, gm, node, terminal, max_extra=10):
         """找去路上几乎不绕路(≤max_extra帧)的任务节点。
