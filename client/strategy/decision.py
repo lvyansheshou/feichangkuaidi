@@ -243,14 +243,13 @@ class DecisionEngine:
     def _advance(self, world, me, gm, src, dst, terminal):
         blocked = self._blocked_nodes(world, me)
 
-        # ★ 多路径评分：仅在任务分<90时做多维度选路（有任务收益时才值得偏离最短路）
+        # ★ 态势感知多路径选择：在起点/岔路口，根据对手位置选策略
         if ((src == gm.start_node or len(gm.neighbors(src)) >= 3)
-                and not blocked and (me.task_score or 0) < 90):
-            best_path = self._select_best_path(world, me, gm, src, dst, blocked)
+                and not blocked):
+            best_path = self._select_strategic_path(world, me, gm, src, dst, blocked)
             if best_path and len(best_path) > 1:
                 nxt = best_path[1]
                 nxt_ns = world.node(nxt)
-                # 下一跳有障碍但非冷却 → 跳过评分，走原有突破逻辑
                 if not (nxt_ns and nxt_ns.has_obstacle
                         and not self._is_cooldown(world, nxt)):
                     if nxt not in blocked:
@@ -351,37 +350,67 @@ class DecisionEngine:
             return "clear"
         return "continue"  # 打平，走原逻辑
 
-    def _select_best_path(self, world, me, gm, src, dst, blocked):
-        """多维度路径选择：枚举候选路径，综合评分选最优。
+    def _select_strategic_path(self, world, me, gm, src, dst, blocked):
+        """态势感知路径选择。
 
-        仅当存在 2+ 条路径且帧数差 ≤ 60 时才做多维度比较（真正有选择余地）。
-        否则回退到 time_optimal_path（最短帧数）。
+        核心原则：比赛在 S10 决胜负。路径选择服务于"抢先到达 S10"。
+        - leading(领先>50帧): 走官道 — 资源+鲜度优势，稳扎稳打
+        - racing(领先10-50帧): 走官道 — 保持领先，不冒险
+        - contested(±20帧): 走山路 — 速度优先，抢先控场
+        - trailing(落后>20帧): 走山路 — 最大速度追分
         """
         paths = gm.enumerate_paths(src, dst, max_paths=3, blocked=blocked)
-        if not paths or len(paths) < 2:
-            return paths[0][0] if paths else None
+        if not paths:
+            return None
+        if len(paths) < 2:
+            return paths[0][0]
 
-        # 帧数差太大 → 没有真正选择，直接选最短
         frames_list = [c for _, c in paths]
-        if max(frames_list) - min(frames_list) > 60:
-            return paths[0][0]  # 最短帧数路径
+        # 帧数差太大 → 直接选最短（没有真正选择）
+        if max(frames_list) - min(frames_list) > 80:
+            return paths[0][0]
 
-        # 帧数接近 → 多维度评分
-        resource_nodes = set()
+        posture = self.opponent.posture
+        task_done = (me.task_score or 0) >= 90
+
+        # 收集资源/任务节点（任务已满时不奖励任务）
+        resource_nodes = {nid for nid, ns in world.node_states.items() if ns.resource_stock}
         task_nodes = set()
-        for nid, ns in world.node_states.items():
-            if ns.resource_stock:
-                resource_nodes.add(nid)
-        for t in (world.active_tasks() if hasattr(world, 'active_tasks') else []):
-            task_nodes.add(t.get("nodeId"))
+        if not task_done:
+            for t in (world.active_tasks() if hasattr(world, 'active_tasks') else []):
+                task_nodes.add(t.get("nodeId"))
+
+        # ★ 态势权重
+        if posture in ("contested", "trailing"):
+            # 速度优先：帧数权重 ↑，鲜度权重 ↓，不关心资源/任务
+            FRAME_WEIGHT = 1.5
+            FRESH_WEIGHT = 15.0
+            RESOURCE_BONUS = 0
+            TASK_BONUS = 0
+        else:
+            # leading/racing: 鲜度保护优先
+            FRAME_WEIGHT = 1.0
+            FRESH_WEIGHT = 35.0
+            RESOURCE_BONUS = -2
+            TASK_BONUS = 0 if task_done else -3
 
         best_path, best_score = None, float("inf")
         for path, frames in paths:
-            score = gm.score_path(path, resource_nodes, task_nodes)
+            # 帧数
+            score = frames * FRAME_WEIGHT
+            # 鲜度
+            freshness_loss = self._estimate_freshness_cost(
+                frames, self._path_route_types(gm, path))
+            score += freshness_loss * FRESH_WEIGHT
+            # 资源
             for n in path:
+                if n in resource_nodes:
+                    score += RESOURCE_BONUS
+                if n in task_nodes:
+                    score += TASK_BONUS
                 ns = world.node(n)
                 if ns and ns.has_obstacle:
-                    score += 15
+                    score += 15  # 障碍风险
             if score < best_score:
                 best_score = score
                 best_path = path
@@ -858,11 +887,10 @@ class DecisionEngine:
 
     def _task_detour_target(self, world, me, gm, node, terminal, extra_budget=0):
         # ★ 任务天花板：90 分解锁满额送达(240)+用时系数(1.0)+里程碑(+35)
-        #   90→110 只多 15 分里程碑，不值得绕路。仅顺路(≤10帧)才做。
+        #   90→110 只多 15 分里程碑，不值得绕路。≥90 后不做非当前节点任务。
         current = me.task_score or 0
         if current >= 90:
-            # 已满 90：仅做顺路任务（几乎不绕路）
-            return self._best_on_path_task(world, me, gm, node, terminal, max_extra=10)
+            return None  # 已满 90：只做当前节点任务(_maybe_task)，不绕路
         if not terminal:
             return None
 

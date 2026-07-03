@@ -228,8 +228,13 @@ class OpponentModel:
         if ref_node is None:
             ref_node = terminal
 
+        # 无对手数据 → 假设对手在起点（保守估计）
         my_node = me.current_node_id or gm.start_node
         opp_node = self.last_node or gm.start_node
+        no_opponent_data = (self.last_node is None)
+        if no_opponent_data:
+            self.posture = "racing"  # 无数据时正常竞速，不进入 contested
+            return self.posture
 
         _, my_eta = gm.time_optimal_path(my_node, ref_node)
         _, opp_eta = gm.time_optimal_path(opp_node, ref_node)
