@@ -345,10 +345,10 @@ class DecisionEngine:
         direct_freshness = self._estimate_freshness_cost(direct_total, direct_route)
         detour_freshness = self._estimate_freshness_cost(detour_total, detour_route)
 
-        # 折算为近似分: 1帧≈0.12分, 1好果≈1.8分, 1鲜度≈1.8分
+        # 折算为近似分: 1帧≈0.12分, 1好果≈1.8分, 1鲜度≈2.5分（加重）
         direct_score_cost = (direct_total * 0.12 + clear_good_cost * 1.8
-                             + direct_freshness * 1.8)
-        detour_score_cost = detour_total * 0.12 + detour_freshness * 1.8
+                             + direct_freshness * 2.5)
+        detour_score_cost = detour_total * 0.12 + detour_freshness * 2.5
 
         # 1.5 分容差（避免在极接近时反复横跳）
         if detour_score_cost + 1.5 < direct_score_cost:
@@ -390,14 +390,21 @@ class DecisionEngine:
             for t in (world.active_tasks() if hasattr(world, 'active_tasks') else []):
                 task_nodes.add(t.get("nodeId"))
 
-        # ★ 态势权重
-        if posture in ("contested", "trailing"):
-            FRAME_WEIGHT, FRESH_WEIGHT = 1.5, 15.0
+        # ★ 态势权重 — 鲜度主导（1鲜度≈1.8分 vs 1帧≈0.12分 ≈ 15:1）
+        if posture == "trailing":
+            FRAME_WEIGHT, FRESH_WEIGHT = 1.5, 20.0   # 追分：速度>鲜度
             RESOURCE_BONUS, TASK_BONUS = 0, 0
-        else:
-            FRAME_WEIGHT, FRESH_WEIGHT = 1.0, 35.0
+        elif posture == "contested":
+            FRAME_WEIGHT, FRESH_WEIGHT = 1.3, 30.0   # 胶着：速度略优，鲜度开始保护
+            RESOURCE_BONUS, TASK_BONUS = 0, 0
+        elif posture == "racing":
+            FRAME_WEIGHT, FRESH_WEIGHT = 1.0, 50.0   # 小幅领先：鲜度保护优先
             RESOURCE_BONUS = -2
             TASK_BONUS = 0 if task_done else -3
+        else:  # leading
+            FRAME_WEIGHT, FRESH_WEIGHT = 0.8, 70.0   # 大幅领先：鲜度最大化 > 速度
+            RESOURCE_BONUS = -3                       # 资源加成↑（稳扎稳打）
+            TASK_BONUS = 0 if task_done else -5       # 任务加成↑（有时间做）
 
         best_path, best_score = None, float("inf")
         for path, frames in paths:
