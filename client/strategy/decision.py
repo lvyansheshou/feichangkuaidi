@@ -71,6 +71,9 @@ class DecisionEngine:
         self._window_rounds = 0      # 连续参与窗口的帧数
         self._last_contested_node = None  # 上次触发窗口的节点
         self._window_node_skip = {}  # nodeId -> 跳过资源/任务直到此回合
+        # 路径缓存
+        self._last_junction = None   # 上次评估路径的岔路口
+        self._chosen_path = None     # 选中的路径
 
     def decide(self, world):
         me = world.me
@@ -243,12 +246,16 @@ class DecisionEngine:
     def _advance(self, world, me, gm, src, dst, terminal):
         blocked = self._blocked_nodes(world, me)
 
-        # ★ 态势感知多路径选择：在起点/岔路口，根据对手位置选策略
-        if ((src == gm.start_node or len(gm.neighbors(src)) >= 3)
-                and not blocked):
-            best_path = self._select_strategic_path(world, me, gm, src, dst, blocked)
-            if best_path and len(best_path) > 1:
-                nxt = best_path[1]
+        # ★ 态势感知多路径选择：仅在到达新岔路口时评估一次（缓存决策）
+        at_junction = (src == gm.start_node or len(gm.neighbors(src)) >= 3)
+        if at_junction and not blocked and src != getattr(self, '_last_junction', None):
+            self._last_junction = src
+            self._chosen_path = self._select_strategic_path(world, me, gm, src, dst, blocked)
+
+        if at_junction and hasattr(self, '_chosen_path') and self._chosen_path:
+            chosen = self._chosen_path
+            if len(chosen) > 1:
+                nxt = chosen[1]
                 nxt_ns = world.node(nxt)
                 if not (nxt_ns and nxt_ns.has_obstacle
                         and not self._is_cooldown(world, nxt)):
@@ -351,13 +358,13 @@ class DecisionEngine:
         return "continue"  # 打平，走原逻辑
 
     def _select_strategic_path(self, world, me, gm, src, dst, blocked):
-        """态势感知路径选择。
+        """态势感知 + 对手路径避让/拦截。
 
-        核心原则：比赛在 S10 决胜负。路径选择服务于"抢先到达 S10"。
-        - leading(领先>50帧): 走官道 — 资源+鲜度优势，稳扎稳打
-        - racing(领先10-50帧): 走官道 — 保持领先，不冒险
-        - contested(±20帧): 走山路 — 速度优先，抢先控场
-        - trailing(落后>20帧): 走山路 — 最大速度追分
+        核心原则：比赛在 S10 决胜负。
+        - 对手走过的路 → 可能有设卡 → 避让 (+30 分惩罚)
+        - 对手正在走的路 → 如果是山路且我们领先 → 走官道避免正面冲突
+        - contested/trailing → 速度优先（山路）
+        - leading/racing → 鲜度保护（官道）
         """
         paths = gm.enumerate_paths(src, dst, max_paths=3, blocked=blocked)
         if not paths:
@@ -366,14 +373,17 @@ class DecisionEngine:
             return paths[0][0]
 
         frames_list = [c for _, c in paths]
-        # 帧数差太大 → 直接选最短（没有真正选择）
         if max(frames_list) - min(frames_list) > 80:
             return paths[0][0]
 
         posture = self.opponent.posture
         task_done = (me.task_score or 0) >= 90
 
-        # 收集资源/任务节点（任务已满时不奖励任务）
+        # ★ 对手路径分析：避让对手设卡节点 + 识别对手路线偏好
+        opp_visited = {n for n, _ in self.opponent.visited_nodes}
+        opp_route_nodes = self._opponent_route_nodes(gm)  # 对手可能走的路线节点
+
+        # 收集资源/任务节点
         resource_nodes = {nid for nid, ns in world.node_states.items() if ns.resource_stock}
         task_nodes = set()
         if not task_done:
@@ -382,27 +392,20 @@ class DecisionEngine:
 
         # ★ 态势权重
         if posture in ("contested", "trailing"):
-            # 速度优先：帧数权重 ↑，鲜度权重 ↓，不关心资源/任务
-            FRAME_WEIGHT = 1.5
-            FRESH_WEIGHT = 15.0
-            RESOURCE_BONUS = 0
-            TASK_BONUS = 0
+            FRAME_WEIGHT, FRESH_WEIGHT = 1.5, 15.0
+            RESOURCE_BONUS, TASK_BONUS = 0, 0
         else:
-            # leading/racing: 鲜度保护优先
-            FRAME_WEIGHT = 1.0
-            FRESH_WEIGHT = 35.0
+            FRAME_WEIGHT, FRESH_WEIGHT = 1.0, 35.0
             RESOURCE_BONUS = -2
             TASK_BONUS = 0 if task_done else -3
 
         best_path, best_score = None, float("inf")
         for path, frames in paths:
-            # 帧数
             score = frames * FRAME_WEIGHT
-            # 鲜度
             freshness_loss = self._estimate_freshness_cost(
                 frames, self._path_route_types(gm, path))
             score += freshness_loss * FRESH_WEIGHT
-            # 资源
+
             for n in path:
                 if n in resource_nodes:
                     score += RESOURCE_BONUS
@@ -410,12 +413,32 @@ class DecisionEngine:
                     score += TASK_BONUS
                 ns = world.node(n)
                 if ns and ns.has_obstacle:
-                    score += 15  # 障碍风险
+                    score += 15
+                # ★ 对手已走过的节点 → 可能有设卡 → +30 避让
+                if n in opp_visited and n not in (gm.start_node,):
+                    score += 30
+                # ★ 对手路线共享节点 → 胶着时避让 (+10)
+                if posture == "contested" and n in opp_route_nodes:
+                    score += 10
+
             if score < best_score:
                 best_score = score
                 best_path = path
 
         return best_path
+
+    def _opponent_route_nodes(self, gm):
+        """推断对手可能走的路线节点集合。
+
+        基于对手已访问节点的路径偏好推断。
+        """
+        opp_visited = {n for n, _ in self.opponent.visited_nodes}
+        if not opp_visited or not gm.terminal_nodes:
+            return set()
+        # 从对手最后位置到终点找最短路 → 推断对手路线
+        last = self.opponent.last_node or gm.start_node
+        path, _ = gm.time_optimal_path(last, gm.terminal_nodes[0])
+        return set(path or [])
 
     def _path_route_types(self, gm, path):
         """返回路径各边的路线类型列表。"""
@@ -1264,7 +1287,7 @@ class DecisionEngine:
         if node != self._stay_node:
             self._stay_node = node
             self._processed_here = False
-            # 切换节点时清除窗口冷却（新节点新环境）
+            # 切换节点时重置窗口计数器
             self._window_rounds = 0
 
         gm = self.ctx.game_map
