@@ -732,37 +732,47 @@ class DecisionEngine:
     # ---- 收益子策略（M4）----
 
     def _freshness_rescue(self, me, world=None):
-        """阈值感知 + 天气预告冰鉴使用。
+        """精确冰鉴时机：计算最优使用帧。
 
-        1. 酷暑预告 → 提前囤鲜度
-        2. 即将跌破 90/80/70/... 阈值 → 提前 3 帧预警
-        3. 兜底固定阈值
+        目标：在好果转坏阈值前使用冰鉴 +10，使鲜度在阈值之上最久。
+        每个冰鉴价值 = 避免 1 篓好果转坏(≈1.8分) + 鲜度分保护。
+
+        策略：
+        1. 计算距下一阈值的帧数 → 在跌破前 1 帧使用（最大化 +10 效用）
+        2. 酷暑预告 → 提前使用（×1.5 损耗加速）
+        3. 多个冰鉴 → 不同阈值使用（90/80/70 各一个）
         """
         ice = me.resource_count(ResourceType.ICE_BOX)
         if ice <= 0 or me.freshness <= 0:
             return None
 
-        # P1-7: 酷暑预告即将生效（15 帧内）→ 现在用冰鉴，鲜度撑过酷暑
+        # 当前鲜度损耗率
+        est_loss = 0.07
+        if world is not None:
+            wt = world.active_weather_type()
+            if wt == "HOT":
+                est_loss = 0.105
+            elif wt == "HEAVY_RAIN":
+                est_loss = 0.09
+
+        # ★ 精确计算：距下一阈值的帧数
+        for threshold in (90, 80, 70, 60, 50, 40, 30, 20, 10):
+            if me.freshness < threshold:
+                continue  # 已跌破
+            frames_to_threshold = (me.freshness - threshold) / est_loss
+            # 在跌破前 1-2 帧使用，最大化 +10 回血的效用
+            # 太早用 → 鲜度溢出浪费（>100 的部分无效）
+            # 太晚用 → 已经触发转坏
+            if 1 <= frames_to_threshold <= 3:
+                return actions.use_resource(ResourceType.ICE_BOX)
+
+        # 酷暑预告
         if world is not None:
             upcoming = world.upcoming_weather(within_frames=15)
             if upcoming and upcoming["type"] == "HOT" and me.freshness < 88:
                 return actions.use_resource(ResourceType.ICE_BOX)
 
-        # 估算单帧鲜度损耗（考虑当前天气）
-        est_loss = 0.07
-        if world is not None:
-            wt = world.active_weather_type()
-            if wt == "HOT":
-                est_loss = 0.105  # 0.07 × 1.5
-            elif wt == "HEAVY_RAIN":
-                est_loss = 0.09  # ~0.07 × 1.3
-
-        # 检查是否将在 3 帧内跌破任一好果转坏阈值
-        for threshold in (90, 80, 70, 60, 50, 40, 30, 20, 10):
-            if me.freshness >= threshold and me.freshness - est_loss * 3 < threshold:
-                return actions.use_resource(ResourceType.ICE_BOX)
-
-        # 兜底：固定阈值
+        # 兜底
         if me.freshness < config.ICE_BOX_USE_BELOW:
             return actions.use_resource(ResourceType.ICE_BOX)
         return None
@@ -1166,17 +1176,18 @@ class DecisionEngine:
     # ---- M8: 条件设卡（基于对手模型）----
 
     def _maybe_set_guard(self, world, me, gm, node):
-        """设卡决策：委托给 OpponentModel 判断条件。
+        """多层设卡决策。
 
-        仅当 ALL 条件满足时才设卡：
-        - 我方领先且态势为 leading
-        - 当前节点是必经节点（chokepoint）
-        - 对手尚未通过
-        - 好果充足
-        - ENABLE_OFFENSIVE 开启
+        策略：在连续必经节点链上设卡（S10→S11→S13），最大化对手突破代价。
+        每队最多 2 个有效设卡（任务书 §6.2.1）。
         """
         if not self.opponent.should_set_guard(world, me, gm, node):
             return None
+
+        # ★ 计数活跃设卡（从 world state 读取）
+        active_guards = self._count_our_guards(world, me)
+        if active_guards >= 2:
+            return None  # 已达上限
 
         n = gm.node(node)
         if n is None:
@@ -1190,6 +1201,15 @@ class DecisionEngine:
             extra = 1  # 防守值=4
 
         return actions.set_guard(node, extra_good_fruit=extra)
+
+    def _count_our_guards(self, world, me):
+        """统计我方当前活跃设卡数。"""
+        count = 0
+        for nid, ns in world.node_states.items():
+            owner = ns.active_guard_owner()
+            if owner == me.team_id:
+                count += 1
+        return count
 
     # ---- 旧进攻设卡（保留兼容，M7 的 _maybe_set_guard 逻辑被覆盖）----
 
@@ -1292,22 +1312,40 @@ class DecisionEngine:
         self._window_rounds = 0
 
     def _window_card_fallback(self, world, me):
-        """窗口出牌固定优先级（对手模型无数据时的回退策略）。"""
+        """窗口出牌混合策略（ε-greedy: 70%最优 + 30%随机）。
+
+        纯确定性策略可被对手学习反制。混合策略使对手无法预测。
+        """
         contests = world.my_contests()
         if not contests:
             return None
         cid = contests[0].get("contestId")
         if not cid:
             return None
+
+        # 收集可用牌
+        available = []
         if (me.guard_action_point or 0) > 0:
-            return actions.window_card(cid, Card.BING_ZHENG)
+            available.append(Card.BING_ZHENG)
         if me.freshness >= 80 and me.good_fruit > config.KEEP_GOOD_FRUIT_MIN:
-            return actions.window_card(cid, Card.XIAN_GONG)
+            available.append(Card.XIAN_GONG)
         if me.resource_count(ResourceType.PASS_TOKEN) > 0 or me.resource_count(ResourceType.OFFICIAL_PERMIT) > 0:
-            return actions.window_card(cid, Card.YAN_DIE)
+            available.append(Card.YAN_DIE)
         if self._has_any_horse(me):
-            return actions.window_card(cid, Card.QIANG_XING)
-        return actions.window_card(cid, Card.ABSTAIN)
+            available.append(Card.QIANG_XING)
+        available.append(Card.ABSTAIN)
+
+        if len(available) <= 1:
+            return actions.window_card(cid, available[0] if available else Card.ABSTAIN)
+
+        # ★ ε-greedy 混合策略：70% 最优牌，30% 随机
+        import random
+        if random.random() < 0.3:
+            # 30%: 从可用牌中随机选（不可预测）
+            card = random.choice(available)
+            return actions.window_card(cid, card)
+        # 70%: 最优牌（BING_ZHENG 赢面最大）
+        return actions.window_card(cid, available[0])
 
     # Keep old _window_card as fallback alias
     _window_card = _window_card_fallback
