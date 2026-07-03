@@ -218,12 +218,32 @@ class DecisionEngine:
         return []
 
     def _opportunistic(self, world, me, gm, node, terminal):
-        # ★ 任务天花板：task_base ≥ 90 后只在当前节点顺路做
-        task_done = self._task_base >= 90 or (me.task_score or 0) >= 90
-        if not task_done or self._task_is_on_path(world, me, gm, node, terminal):
+        # ★ 任务分段天花板（上限 180 = base + milestone）
+        base = self._task_base
+        if base == 0 and (me.task_score or 0) >= 90:
+            base = me.task_score  # 兼容测试
+
+        # ≥130: 已满 180 上限（130+50=180），浪费帧 → 完全不做
+        if base >= 130:
+            pass  # skip task
+        # ≥110: 里程碑已满（+50），只有当前节点顺路才做
+        elif base >= 110:
+            if self._task_is_on_path(world, me, gm, node, terminal):
+                task = self._maybe_task(world, me, gm, node, terminal)
+                if task:
+                    return [task]
+        # ≥90: 解锁核心阈值，只在当前节点做
+        elif base >= 90:
+            if self._task_is_on_path(world, me, gm, node, terminal):
+                task = self._maybe_task(world, me, gm, node, terminal)
+                if task:
+                    return [task]
+        # <90: 正常追求
+        else:
             task = self._maybe_task(world, me, gm, node, terminal)
             if task:
                 return [task]
+
         claim = self._maybe_claim(world, me, gm, node, terminal)
         if claim:
             return [claim]
@@ -946,7 +966,7 @@ class DecisionEngine:
         if base == 0 and (me.task_score or 0) >= 90:
             base = me.task_score  # 测试环境：手动设置了 task_score
 
-        # 已满 90：不绕路
+        # ≥90 解锁核心阈值 → 不绕路（当前节点任务由 _opportunistic 处理）
         if base >= 90:
             return None
         if not terminal:
