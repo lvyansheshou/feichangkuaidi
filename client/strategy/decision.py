@@ -185,6 +185,11 @@ class DecisionEngine:
         if opp:
             return opp
 
+        # ★ 主动攻击：顺路狩猎敌方设卡悬赏
+        bounty_attack = self._active_bounty_hunt(world, me, gm, node, terminal)
+        if bounty_attack:
+            return [bounty_attack]
+
         # M8: 条件设卡（仅在领先且在必经节点时）
         guard = self._maybe_set_guard(world, me, gm, node)
         if guard:
@@ -207,13 +212,31 @@ class DecisionEngine:
         return []
 
     def _opportunistic(self, world, me, gm, node, terminal):
-        task = self._maybe_task(world, me, gm, node, terminal)
-        if task:
-            return [task]
+        # ★ 任务天花板：≥90 后只有顺路(≤10帧)才做任务
+        if (me.task_score or 0) < 90 or self._task_is_on_path(world, me, gm, node, terminal):
+            task = self._maybe_task(world, me, gm, node, terminal)
+            if task:
+                return [task]
         claim = self._maybe_claim(world, me, gm, node, terminal)
         if claim:
             return [claim]
         return None
+
+    def _task_is_on_path(self, world, me, gm, node, terminal):
+        """当前节点的任务是否在去路上（几乎不绕路）。"""
+        if not terminal or not node:
+            return False
+        for t in world.active_tasks():
+            if t.get("nodeId") != node:
+                continue
+            if t.get("taskTemplateId") in config.SKIP_TASK_TEMPLATES:
+                continue
+            # 从当前节点做完任务后到终点的路径
+            _, direct = gm.time_optimal_path(node, terminal)
+            _, via_task = gm.time_optimal_path(node, terminal)  # 做完任务后还是从 node 出发
+            if direct != _INF:
+                return True  # 当前节点就在去路上
+        return False
 
     # ---- 阻塞感知推进 + 突破 + 绕行/清障权衡 ----
 
@@ -462,6 +485,54 @@ class DecisionEngine:
                 btype = b.get("type", "")
                 return 18 if btype == "KEY_BOUNTY" else 10
         return 0
+
+    def _active_bounty_hunt(self, world, me, gm, node, terminal):
+        """主动狩猎：如果去路上有带悬赏的敌方设卡，评估是否值得主动攻击。
+
+        条件：
+        - 敌方设卡在必经路径上（顺路，不绕路）
+        - 有可结算悬赏（10-18 分基础 + 20 分悬赏完成 = 30-38 分）
+        - 我方好果/坏果足够攻坚
+        - 态势不是 trailing（落后时不恋战）
+        """
+        if self.opponent.posture == "trailing":
+            return None  # 落后时不狩猎，专注追分
+        if not terminal:
+            return None
+
+        # 找去路上第一个有悬赏的敌方设卡
+        path, _ = gm.time_optimal_path(node, terminal)
+        if not path:
+            return None
+
+        for nid in path[1:]:  # 跳过当前节点
+            ns = world.node(nid)
+            if not ns:
+                continue
+            owner = ns.active_guard_owner()
+            if not owner or owner == me.team_id:
+                continue
+            bounty = self._check_bounty(world, nid)
+            if bounty <= 0:
+                continue
+
+            # 必须在相邻节点才能攻坚（任务书 §6.3.1）
+            if nid not in gm.neighbors(node):
+                continue
+
+            # 能攻得动吗？
+            plan = self._plan_attack(world, me, ns)
+            if plan is None:
+                continue
+
+            # ★ 成本收益分析
+            g, b, bo = plan
+            attack_cost = g * 1.8 + b * 0.5  # 好果≈1.8分, 坏果≈0.5分
+            bounty_value = bounty + 20       # 悬赏基础 + 完成奖励
+            if bounty_value > attack_cost:
+                return actions.break_guard(nid, good_fruit=g, bad_fruit=b,
+                                           rush_tactic=(Action.BREAK_ORDER if bo else None))
+        return None
 
     def _plan_attack(self, world, me, ns):
         defense = (ns.guard or {}).get("defense", 0) or 0
@@ -786,23 +857,25 @@ class DecisionEngine:
     # ---- 绕路做任务（M7）----
 
     def _task_detour_target(self, world, me, gm, node, terminal, extra_budget=0):
-        if (me.task_score or 0) >= 90 or not terminal:
+        # ★ 任务天花板：90 分解锁满额送达(240)+用时系数(1.0)+里程碑(+35)
+        #   90→110 只多 15 分里程碑，不值得绕路。仅顺路(≤10帧)才做。
+        current = me.task_score or 0
+        if current >= 90:
+            # 已满 90：仅做顺路任务（几乎不绕路）
+            return self._best_on_path_task(world, me, gm, node, terminal, max_extra=10)
+        if not terminal:
             return None
+
         pid = self.ctx.player_id
         _, direct = gm.time_optimal_path(node, terminal)
         if direct == _INF:
             return None
 
         # M8: 里程碑感知动态预算
-        current = me.task_score or 0
         if current < 60:
             base_budget = config.TASK_DETOUR_MAX_EXTRA_FRAMES       # 70
-        elif current < 90:
+        else:  # 60-89
             base_budget = config.TASK_DETOUR_MAX_EXTRA_FRAMES + 40  # 110（逼近90阈值）
-        elif current < 110:
-            base_budget = config.TASK_DETOUR_MAX_EXTRA_FRAMES       # 70
-        else:
-            base_budget = 20                                        # 已解锁全部
 
         budget = base_budget + extra_budget
         if budget < 0:
@@ -828,6 +901,42 @@ class DecisionEngine:
             pr = t.get("processRound", 0) or 0
             extra = (c1 + pr + c2) - direct
             if 0 <= extra <= budget and extra < best_extra \
+                    and self._can_afford(world, gm, node, extra, terminal):
+                best, best_extra = tn, extra
+        return best
+
+    def _best_on_path_task(self, world, me, gm, node, terminal, max_extra=10):
+        """找去路上几乎不绕路(≤max_extra帧)的任务节点。
+
+        用于任务分≥90后：只做顺路任务，不专门绕路。
+        """
+        if not terminal:
+            return None
+        pid = self.ctx.player_id
+        _, direct = gm.time_optimal_path(node, terminal)
+        if direct == _INF:
+            return None
+
+        best, best_extra = None, _INF
+        for t in world.active_tasks():
+            tn = t.get("nodeId")
+            if not tn or tn == node:
+                continue
+            if t.get("taskTemplateId") in config.SKIP_TASK_TEMPLATES:
+                continue
+            prot = t.get("protectionPlayerId") or 0
+            if prot and prot != pid:
+                continue
+            owner = t.get("ownerPlayerId") or 0
+            if owner and owner != pid:
+                continue
+            _, c1 = gm.time_optimal_path(node, tn)
+            _, c2 = gm.time_optimal_path(tn, terminal)
+            if c1 == _INF or c2 == _INF:
+                continue
+            pr = t.get("processRound", 0) or 0
+            extra = (c1 + pr + c2) - direct
+            if 0 <= extra <= max_extra and extra < best_extra \
                     and self._can_afford(world, gm, node, extra, terminal):
                 best, best_extra = tn, extra
         return best
