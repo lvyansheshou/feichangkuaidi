@@ -12,6 +12,13 @@
   * 绕路做任务：任务分<90 且时间预算允许时，向近处任务节点绕行以拉高任务分。
   * 防御性小分队：预清路线前方障碍(SQUAD_CLEAR)/削弱前方敌卡(SQUAD_WEAKEN)。
   * 进攻干扰(默认关闭，config.ENABLE_OFFENSIVE)：关键关隘主动设卡。
+- M8 博弈对抗（对手建模 + 自适应）：
+  * 对手轨迹追踪与路径预测
+  * 战略态势判定（leading/racing/trailing/contested/sprinting）
+  * 窗口出牌反制（基于历史模式）
+  * 条件设卡（仅在领先且在必经节点时）
+  * FORCED_PASS 退避（防止无限循环）
+  * 态势感知任务优先级
 
 策略与通信解耦：只依赖 core.WorldState / GameMap，不 import socket。
 """
@@ -20,6 +27,7 @@ import config
 from core.game_map import GameMap
 from protocol import actions
 from protocol.enums import Action, Card, PlayerState, ResourceType
+from strategy.opponent_model import OpponentModel
 
 _IDLE_LIKE = (PlayerState.IDLE, PlayerState.COST_BANKRUPT, None)
 _MOVE_BUFF_TYPES = frozenset({ResourceType.FAST_HORSE, ResourceType.SHORT_HORSE, "RUSH_SPEED"})
@@ -55,6 +63,10 @@ class DecisionEngine:
         self._cooldown = {}          # nodeId -> 拉黑截止回合（拒绝反馈）
         self._last_main_action = None
         self._squad_sent = set()     # (nodeId, kind) 已派出的小分队目标，避免重复
+        # M8 博弈对抗
+        self.opponent = OpponentModel()
+        self._fp_failures = {}       # nodeId -> FORCED_PASS 连续失败次数（退避用）
+        self._fp_last_node = None    # 上次尝试 FORCED_PASS 的目标节点
 
     def decide(self, world):
         me = world.me
@@ -65,6 +77,11 @@ class DecisionEngine:
         node = me.current_node_id
         self._apply_rejection_feedback(world)
         self._update_process_memory(world, me, node)
+
+        # M8: 更新对手模型 + 评估战略态势
+        self.opponent.update(world)
+        self.opponent.assess_posture(world, me, gm)
+
         terminal = gm.terminal_nodes[0] if gm.terminal_nodes else None
         gate = gm.gate_node
 
@@ -73,10 +90,13 @@ class DecisionEngine:
             if me.delivered or me.state == PlayerState.DELIVERED:
                 result = []
                 return result
-            card = self._window_card(world, me)
+
+            # M8: 自适应窗口出牌（基于对手模型）
+            card = self._window_card_adaptive(world, me)
             if card:
                 result = [card]
                 return result
+
             if me.state in (PlayerState.MOVING, PlayerState.WAITING):
                 horse = self._maybe_horse(me, gm, terminal)
                 result = [horse] if horse else []
@@ -109,6 +129,10 @@ class DecisionEngine:
         if gate and node == gate:
             if not me.verified:
                 if world.is_rush:
+                    # M8: 破关令加速验核 6→3 帧（成本：坏果≥2 优先，否则 1 好果）
+                    if (me.rush_tactic_used_count or 0) == 0:
+                        if me.bad_fruit >= 2 or me.good_fruit > config.KEEP_GOOD_FRUIT_MIN:
+                            return [actions.verify_gate(rush_tactic=Action.BREAK_ORDER)]
                     rp = self._maybe_rush_protect(world, me)
                     if rp:
                         return [rp]
@@ -127,16 +151,31 @@ class DecisionEngine:
         if rp:
             return [rp]
 
+        # M8: 态势感知任务优先级
+        # leading → 保持领先，不做耗时任务
+        # trailing → 激进做任务（需要追分）
+        # racing/contested → 机会式
         opp = self._opportunistic(world, me, gm, node, terminal)
         if opp:
             return opp
 
+        # M8: 条件设卡（仅在领先且在必经节点时）
         guard = self._maybe_set_guard(world, me, gm, node)
         if guard:
             return [guard]
 
-        # 绕路做任务：任务分<90 且预算允许时，先去近处任务节点
-        dst = self._task_detour_target(world, me, gm, node, terminal) or terminal
+        # 绕路做任务：落后时更激进，领先时保守
+        if self.opponent.posture in ("trailing",):
+            # 落后 → 扩大任务绕路预算追分
+            dst = self._task_detour_target(world, me, gm, node, terminal,
+                                           extra_budget=40) or terminal
+        elif self.opponent.posture in ("leading",):
+            # 领先 → 收紧预算，优先保持领先
+            dst = self._task_detour_target(world, me, gm, node, terminal,
+                                           extra_budget=-20) or terminal
+        else:
+            dst = self._task_detour_target(world, me, gm, node, terminal) or terminal
+
         if dst:
             return self._advance(world, me, gm, node, dst, terminal)
         return []
@@ -197,18 +236,33 @@ class DecisionEngine:
         if ns and ns.has_obstacle:
             t04 = self._find_t04(world, nxt)
             if t04 and self._can_afford(world, gm, me.current_node_id, t04.get("processRound", 6) or 6, terminal):
+                self._fp_failures.pop(nxt, None)  # T04 不是 FORCED_PASS，重置计数
                 return [actions.claim_task(t04.get("taskId"))]
             if me.good_fruit > config.KEEP_GOOD_FRUIT_MIN:
+                self._fp_failures.pop(nxt, None)
                 return [actions.clear(nxt)]
+            # 障碍 FORCED_PASS 不受 retry 限制（无窗口争夺，必然成功）
             return [actions.forced_pass(nxt)]
+
         owner = ns.active_guard_owner() if ns else None
         if owner and owner != me.team_id:
             plan = self._plan_attack(world, me, ns)
             if plan is not None:
+                self._fp_failures.pop(nxt, None)  # 攻坚重置 FORCED_PASS 计数
                 g, b, bo = plan
                 return [actions.break_guard(nxt, good_fruit=g, bad_fruit=b,
                                             rush_tactic=(Action.BREAK_ORDER if bo else None))]
+
+            # M8: FORCED_PASS 退避机制
+            # 连续失败 ≥ FP_RETRY_LIMIT → 等待（对手可能交付/设卡风化）
+            fails = self._fp_failures.get(nxt, 0)
+            if fails >= config.FP_RETRY_LIMIT:
+                return []  # WAIT：等对手交付后 PASS 窗口自动弃权
+
+            self._fp_failures[nxt] = fails + 1
+            self._fp_last_node = nxt
             return [actions.forced_pass(nxt)]
+
         return [actions.move(nxt)]
 
     def _find_t04(self, world, node):
@@ -241,6 +295,10 @@ class DecisionEngine:
         la = self._last_main_action
         if la is None:
             return
+
+        # M8: 检测 FORCED_PASS 结果
+        self._detect_fp_result(world, la)
+
         code = self._my_reject_code(world)
         if not code:
             return
@@ -251,6 +309,35 @@ class DecisionEngine:
             tgt = la.get("targetNodeId")
             if tgt:
                 self._cooldown[tgt] = (world.round or 0) + config.REJECT_BLOCK_ROUNDS
+
+    def _detect_fp_result(self, world, last_action):
+        """检测 FORCED_PASS 成败，维护退避计数器。
+
+        成功：到达目标节点（位置变化到目标）
+        失败：进入 RESTING 状态（PASS 窗口失利）
+        """
+        if last_action.get("action") != Action.FORCED_PASS:
+            return
+        tgt = last_action.get("targetNodeId")
+        if not tgt:
+            return
+
+        me = world.me
+        if me is None:
+            return
+
+        # 成功：当前位置已到达目标
+        if me.current_node_id == tgt:
+            self._fp_failures.pop(tgt, None)
+            self._fp_last_node = None
+            return
+
+        # 失败：进入 RESTING
+        if me.state == PlayerState.RESTING:
+            # 计数已在 _breakthrough 中增加，此处不重复
+            return
+
+        # 仍在 FORCED_PASSING：正常进行中
 
     def _my_reject_code(self, world):
         pid = self.ctx.player_id
@@ -267,8 +354,26 @@ class DecisionEngine:
 
     # ---- 收益子策略（M4）----
 
-    def _freshness_rescue(self, me):
-        if me.resource_count(ResourceType.ICE_BOX) > 0 and 0 < me.freshness < config.ICE_BOX_USE_BELOW:
+    def _freshness_rescue(self, me, world=None):
+        """阈值感知冰鉴使用。
+
+        优先在即将跌破 90/80/70/... 阈值前使用，最大化 +10 回血效用。
+        回退到固定阈值 ICE_BOX_USE_BELOW。
+        """
+        ice = me.resource_count(ResourceType.ICE_BOX)
+        if ice <= 0 or me.freshness <= 0:
+            return None
+
+        # 估算单帧鲜度损耗（保守取山路值）
+        est_loss = 0.07
+
+        # 检查是否将在 3 帧内跌破任一好果转坏阈值
+        for threshold in (90, 80, 70, 60, 50, 40, 30, 20, 10):
+            if me.freshness >= threshold and me.freshness - est_loss * 3 < threshold:
+                return actions.use_resource(ResourceType.ICE_BOX)
+
+        # 兜底：固定阈值
+        if me.freshness < config.ICE_BOX_USE_BELOW:
             return actions.use_resource(ResourceType.ICE_BOX)
         return None
 
@@ -394,13 +499,29 @@ class DecisionEngine:
 
     # ---- 绕路做任务（M7）----
 
-    def _task_detour_target(self, world, me, gm, node, terminal):
+    def _task_detour_target(self, world, me, gm, node, terminal, extra_budget=0):
         if (me.task_score or 0) >= 90 or not terminal:
             return None
         pid = self.ctx.player_id
         _, direct = gm.time_optimal_path(node, terminal)
         if direct == _INF:
             return None
+
+        # M8: 里程碑感知动态预算
+        current = me.task_score or 0
+        if current < 60:
+            base_budget = config.TASK_DETOUR_MAX_EXTRA_FRAMES       # 70
+        elif current < 90:
+            base_budget = config.TASK_DETOUR_MAX_EXTRA_FRAMES + 40  # 110（逼近90阈值）
+        elif current < 110:
+            base_budget = config.TASK_DETOUR_MAX_EXTRA_FRAMES       # 70
+        else:
+            base_budget = 20                                        # 已解锁全部
+
+        budget = base_budget + extra_budget
+        if budget < 0:
+            budget = 0
+
         best, best_extra = None, _INF
         for t in world.active_tasks():
             tn = t.get("nodeId")
@@ -420,7 +541,7 @@ class DecisionEngine:
                 continue
             pr = t.get("processRound", 0) or 0
             extra = (c1 + pr + c2) - direct
-            if 0 <= extra <= config.TASK_DETOUR_MAX_EXTRA_FRAMES and extra < best_extra \
+            if 0 <= extra <= budget and extra < best_extra \
                     and self._can_afford(world, gm, node, extra, terminal):
                 best, best_extra = tn, extra
         return best
@@ -477,9 +598,38 @@ class DecisionEngine:
         self._gate_scout_sent = True
         return actions.squad_scout(gate)
 
-    # ---- 进攻干扰（M7，默认关闭）----
+    # ---- M8: 条件设卡（基于对手模型）----
 
     def _maybe_set_guard(self, world, me, gm, node):
+        """设卡决策：委托给 OpponentModel 判断条件。
+
+        仅当 ALL 条件满足时才设卡：
+        - 我方领先且态势为 leading
+        - 当前节点是必经节点（chokepoint）
+        - 对手尚未通过
+        - 好果充足
+        - ENABLE_OFFENSIVE 开启
+        """
+        if not self.opponent.should_set_guard(world, me, gm, node):
+            return None
+
+        n = gm.node(node)
+        if n is None:
+            return None
+
+        # 计算最优额外好果投入
+        extra = 0
+        if n.type == "KEY_PASS" and me.good_fruit >= 22:
+            extra = 2  # 防守值=6，风化延迟45帧
+        elif me.good_fruit >= 21:
+            extra = 1  # 防守值=4
+
+        return actions.set_guard(node, extra_good_fruit=extra)
+
+    # ---- 旧进攻设卡（保留兼容，M7 的 _maybe_set_guard 逻辑被覆盖）----
+
+    def _maybe_set_guard_legacy(self, world, me, gm, node):
+        """M7 原始设卡逻辑（ENABLE_OFFENSIVE=False 时不会被调用）。"""
         if not config.ENABLE_OFFENSIVE or world.is_rush:
             return None
         n = gm.node(node)
@@ -488,13 +638,34 @@ class DecisionEngine:
         ns = world.node(node)
         if ns and ns.guard and (ns.guard.get("defense", 0) or 0) > 0:
             return None
-        if me.good_fruit < 20:  # 保留充足好果用于交付得分
+        if me.good_fruit < 20:
             return None
         return actions.set_guard(node, extra_good_fruit=1)
 
-    # ---- 窗口出牌 ----
+    # ---- M8: 自适应窗口出牌 ----
 
-    def _window_card(self, world, me):
+    def _window_card_adaptive(self, world, me):
+        """自适应窗口出牌：优先使用对手模型反制，回退到固定优先级。"""
+        contests = world.my_contests()
+        if not contests:
+            return None
+
+        c = contests[0]
+        cid = c.get("contestId")
+        if not cid:
+            return None
+
+        # 尝试自适应反制
+        result = self.opponent.adaptive_window_card(world, me, c)
+        if result is not None:
+            cid, card = result
+            return actions.window_card(cid, card)
+
+        # 回退到固定优先级（原 _window_card 逻辑）
+        return self._window_card_fallback(world, me)
+
+    def _window_card_fallback(self, world, me):
+        """窗口出牌固定优先级（对手模型无数据时的回退策略）。"""
         contests = world.my_contests()
         if not contests:
             return None
@@ -510,6 +681,9 @@ class DecisionEngine:
         if self._has_any_horse(me):
             return actions.window_card(cid, Card.QIANG_XING)
         return actions.window_card(cid, Card.ABSTAIN)
+
+    # Keep old _window_card as fallback alias
+    _window_card = _window_card_fallback
 
     # ---- 辅助 ----
 

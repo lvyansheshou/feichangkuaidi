@@ -77,7 +77,8 @@ class TestBaselineStrategy(unittest.TestCase):
 
     def test_gate_verify_when_rush(self):
         a = self.act(make_world("S14", phase="RUSH", verified=False, game_map=self.gm))
-        self.assertEqual(a, {"action": "VERIFY_GATE"})
+        # M8: RUSH 阶段验核自动绑定破关令（加速 6→3 帧）
+        self.assertEqual(a, {"action": "VERIFY_GATE", "rushTactic": "BREAK_ORDER"})
 
     def test_gate_advance_after_verified(self):
         a = self.act(make_world("S14", phase="RUSH", verified=True, game_map=self.gm))

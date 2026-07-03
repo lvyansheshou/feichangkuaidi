@@ -205,3 +205,69 @@ class GameMap:
 
     def distance_to_gate(self, source):
         return self.route_distance(source, self.gate_node) if self.gate_node else math.inf
+
+    # ── 必经节点（chokepoint / articulation point）──
+
+    @property
+    def chokepoints(self):
+        """所有 start→terminal 路径都必须经过的节点集合。
+
+        算法：从 terminal 反向 BFS 收缩。只沿"原始边方向"的反向追溯：
+        对于每条边 from→to，将 from 视为 to 的前驱。
+        若某节点的所有原始后继（from→to 中的 to）都在 choke 中，则该节点也是 choke。
+
+        双向边的反向边（to→from）不参与前驱关系（它们代表"倒退"而非"前进"），
+        避免了循环图导致的漏判。
+        """
+        if getattr(self, "_chokepoints", None) is not None:
+            return self._chokepoints
+
+        terms = self.terminal_nodes
+        if not terms:
+            self._chokepoints = set()
+            return self._chokepoints
+
+        terminal = terms[0]
+
+        # 前驱关系只沿原始边方向：from→to 意味着 from 是 to 的前驱
+        preds = {}
+        succs_forward = {}
+        for e in self.edges:
+            preds.setdefault(e.to_node, set()).add(e.from_node)
+            succs_forward.setdefault(e.from_node, set()).add(e.to_node)
+
+        choke = {terminal}
+        queue = [terminal]
+        while queue:
+            cur = queue.pop(0)
+            for pred in preds.get(cur, set()):
+                if pred in choke:
+                    continue
+                # pred 的所有前向后继都必须已在 choke 中
+                succs = succs_forward.get(pred, set())
+                if succs and succs.issubset(choke):
+                    choke.add(pred)
+                    queue.append(pred)
+
+        self._chokepoints = choke
+        return self._chokepoints
+
+    def is_chokepoint(self, node_id):
+        """node_id 是否为必经节点。"""
+        return node_id in self.chokepoints
+
+    def next_chokepoint(self, source):
+        """从 source 出发，去 terminal 路径上的下一个必经节点。
+
+        用于判断"对手是否即将通过关键位置"。
+        """
+        terminal = self.terminal_nodes[0] if self.terminal_nodes else None
+        if not terminal:
+            return None
+        path, _ = self.time_optimal_path(source, terminal)
+        if not path:
+            return None
+        for nid in path:
+            if nid in self.chokepoints:
+                return nid
+        return None

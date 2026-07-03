@@ -206,8 +206,9 @@ class TestOffensiveGuardFlag(unittest.TestCase):
         config.ENABLE_OFFENSIVE = True
         try:
             eng2 = DecisionEngine(GameContext(PID, "RED", 0, m))
+            # M8: 关键关隘投入 2 好果（防守值=6，风化延迟45帧）
             self.assertEqual(eng2.decide(world(m, gm, "SK", good=100))[0],
-                             {"action": "SET_GUARD", "targetNodeId": "SK", "extraGoodFruit": 1})
+                             {"action": "SET_GUARD", "targetNodeId": "SK", "extraGoodFruit": 2})
         finally:
             config.ENABLE_OFFENSIVE = old
 
