@@ -28,6 +28,11 @@ from core.game_map import GameMap
 from protocol import actions
 from protocol.enums import Action, Card, PlayerState, ResourceType
 from strategy.opponent_model import OpponentModel
+from strategy.scoring import (estimate_total, marginal_task_value, marginal_guard_value,
+                               is_cliff_edge, milestone_delta, task_score as calc_task_score,
+                               delivery_base_score, good_fruit_score, freshness_score,
+                               time_score as calc_time_score, bounty_score as calc_bounty_score)
+from strategy.phases import StrategyPhase, determine_phase, phase_strategy_weights
 
 _IDLE_LIKE = (PlayerState.IDLE, PlayerState.COST_BANKRUPT, None)
 _MOVE_BUFF_TYPES = frozenset({ResourceType.FAST_HORSE, ResourceType.SHORT_HORSE, "RUSH_SPEED"})
@@ -77,6 +82,8 @@ class DecisionEngine:
         # 任务追踪
         self._task_base = 0          # 普通任务基础分累计（不含里程碑）
         self._completed_task_ids = set()  # 已完成的任务 ID
+        # 阶段追踪
+        self._strategy_phase = StrategyPhase.RACING
 
     def decide(self, world):
         me = world.me
@@ -382,13 +389,12 @@ class DecisionEngine:
         return "continue"  # 打平，走原逻辑
 
     def _select_strategic_path(self, world, me, gm, src, dst, blocked):
-        """态势感知 + 对手路径避让/拦截。
+        """基于文档公式的得分驱动路径选择。
 
-        核心原则：比赛在 S10 决胜负。
-        - 对手走过的路 → 可能有设卡 → 避让 (+30 分惩罚)
-        - 对手正在走的路 → 如果是山路且我们领先 → 走官道避免正面冲突
-        - contested/trailing → 速度优先（山路）
-        - leading/racing → 鲜度保护（官道）
+        核心原则（任务书 §7.2）：
+        - 鲜度是最高杠杆资源（1鲜度≈1.8分）
+        - 任务有悬崖效应（60/90/110 阈值跳跃）
+        - 对手走过的路有设卡风险
         """
         paths = gm.enumerate_paths(src, dst, max_paths=3, blocked=blocked)
         if not paths:
@@ -400,56 +406,43 @@ class DecisionEngine:
         if max(frames_list) - min(frames_list) > 80:
             return paths[0][0]
 
-        posture = self.opponent.posture
+        # ★ 阶段判定 + 权重
+        phase = determine_phase(world, me, gm)
+        self._strategy_phase = phase
+        FRAME_W, FRESH_W, RES_BONUS, TASK_BONUS = phase_strategy_weights(
+            phase, self.opponent.posture)
+
         task_done = (self._task_base >= 90 or (me.task_score or 0) >= 90)
 
-        # ★ 对手路径分析：避让对手设卡节点 + 识别对手路线偏好
+        # 对手路径分析
         opp_visited = {n for n, _ in self.opponent.visited_nodes}
-        opp_route_nodes = self._opponent_route_nodes(gm)  # 对手可能走的路线节点
+        opp_route_nodes = self._opponent_route_nodes(gm)
 
-        # 收集资源/任务节点
+        # 资源/任务节点
         resource_nodes = {nid for nid, ns in world.node_states.items() if ns.resource_stock}
         task_nodes = set()
         if not task_done:
             for t in (world.active_tasks() if hasattr(world, 'active_tasks') else []):
                 task_nodes.add(t.get("nodeId"))
 
-        # ★ 态势权重 — 鲜度主导（1鲜度≈1.8分 vs 1帧≈0.12分 ≈ 15:1）
-        if posture == "trailing":
-            FRAME_WEIGHT, FRESH_WEIGHT = 1.5, 20.0   # 追分：速度>鲜度
-            RESOURCE_BONUS, TASK_BONUS = 0, 0
-        elif posture == "contested":
-            FRAME_WEIGHT, FRESH_WEIGHT = 1.3, 30.0   # 胶着：速度略优，鲜度开始保护
-            RESOURCE_BONUS, TASK_BONUS = 0, 0
-        elif posture == "racing":
-            FRAME_WEIGHT, FRESH_WEIGHT = 1.0, 50.0   # 小幅领先：鲜度保护优先
-            RESOURCE_BONUS = -2
-            TASK_BONUS = 0 if task_done else -3
-        else:  # leading
-            FRAME_WEIGHT, FRESH_WEIGHT = 0.8, 70.0   # 大幅领先：鲜度最大化 > 速度
-            RESOURCE_BONUS = -3                       # 资源加成↑（稳扎稳打）
-            TASK_BONUS = 0 if task_done else -5       # 任务加成↑（有时间做）
-
         best_path, best_score = None, float("inf")
         for path, frames in paths:
-            score = frames * FRAME_WEIGHT
+            score = frames * FRAME_W
             freshness_loss = self._estimate_freshness_cost(
                 frames, self._path_route_types(gm, path))
-            score += freshness_loss * FRESH_WEIGHT
+            score += freshness_loss * FRESH_W
 
             for n in path:
                 if n in resource_nodes:
-                    score += RESOURCE_BONUS
+                    score += RES_BONUS
                 if n in task_nodes:
                     score += TASK_BONUS
                 ns = world.node(n)
                 if ns and ns.has_obstacle:
                     score += 15
-                # ★ 对手已走过的节点 → 可能有设卡 → +30 避让
                 if n in opp_visited and n not in (gm.start_node,):
                     score += 30
-                # ★ 对手路线共享节点 → 胶着时避让 (+10)
-                if posture == "contested" and n in opp_route_nodes:
+                if self.opponent.posture == "contested" and n in opp_route_nodes:
                     score += 10
 
             if score < best_score:
