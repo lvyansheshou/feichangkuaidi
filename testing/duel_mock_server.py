@@ -507,9 +507,10 @@ class DuelMockServer:
                         ns.guard_defense = max(0, ns.guard_defense - 2)
 
             elif act == Action.RUSH_SPEED:
-                # 疾行令不消耗果品（任务书 §6.5），但鲜度损耗 ×1.25
-                if not c.rush_tactic_used:
+                # 疾行令成本 2 好果（任务书 §6.5）
+                if not c.rush_tactic_used and c.good_fruit >= 2:
                     c.rush_tactic_used = True
+                    c.good_fruit -= 2
                     c.buffs.append({"type": "RUSH_SPEED", "remainingRound": 15})
 
             elif act == Action.RUSH_PROTECT:

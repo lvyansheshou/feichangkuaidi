@@ -136,15 +136,21 @@ class TestBreakthroughGuard(unittest.TestCase):
         self.assertEqual(a["action"], "BREAK_GUARD")
         self.assertEqual(a.get("rushTactic"), "BREAK_ORDER")  # 2好果(4)+破关令(3)=7
 
-    def test_forced_pass_when_cannot_afford(self):
-        # 防守值 5，bad=0：需 3 好果（3×2=6≥5），P0 修复后攻得动
-        w = world(LINEAR, node="S01", nodes=[guard_node("SB", "BLUE", 5)], gm=self.gm, good=100, bad=0)
+    def test_break_guard_max_fruit_cap(self):
+        # §6.3.1: 好果各最多 2 篓 → 防4 可用 2 好果(4)攻破
+        w = world(LINEAR, node="S01", nodes=[guard_node("SB", "BLUE", 4)], gm=self.gm, good=100, bad=0)
         a = self.eng().decide(w)[0]
         self.assertEqual(a["action"], "BREAK_GUARD")
-        self.assertGreaterEqual(a.get("goodFruit", 0) * 2 + a.get("badFruit", 0) * 3, 5)
+        self.assertLessEqual(a.get("goodFruit", 0), 2)  # 不超上限
+
+    def test_forced_pass_when_cannot_afford(self):
+        # 防5, bad=0, max攻=2×2=4<5 → 强制通行
+        w = world(LINEAR, node="S01", nodes=[guard_node("SB", "BLUE", 5)], gm=self.gm, good=100, bad=0)
+        a = self.eng().decide(w)[0]
+        self.assertEqual(a, {"action": "FORCED_PASS", "targetNodeId": "SB"})
 
     def test_forced_pass_when_truly_cannot_afford(self):
-        # 防守值 7, bad=0, good 仅够保底 → 最大攻 4 < 7 → 强制通行
+        # 防守值 7, bad=0, good 仅够保底 → max攻=(2-1)×2=2<7 → 强制通行
         w = world(LINEAR, node="S01", nodes=[guard_node("SB", "BLUE", 7)], gm=self.gm, good=3, bad=0)
         a = self.eng().decide(w)[0]
         self.assertEqual(a, {"action": "FORCED_PASS", "targetNodeId": "SB"})

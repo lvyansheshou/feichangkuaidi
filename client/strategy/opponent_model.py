@@ -119,26 +119,37 @@ class OpponentModel:
                 self._record_window_result(c, world)
 
     def _record_window_result(self, contest, world):
-        """从已结算窗口中提取对手出牌信息。"""
+        """从已结算窗口中提取对手出牌信息。
+
+        协议字段: contest.cards = {teamId: card, ...}, contest.winnerTeamId
+        """
         pid = world.player_id
-        # 判断对手身份
-        red = contest.get("redPlayerId")
-        blue = contest.get("bluePlayerId")
-        opp_id = red if red != pid else blue
-        if not opp_id:
+        my_team = world.me.team_id if world.me else None
+        if not my_team:
             return
-        # 尝试从结果中提取出牌（协议字段取决于具体实现）
-        results = contest.get("results") or []
-        for beat in results:
-            cards = beat.get("cards") or {}
-            their_card = cards.get(str(opp_id))
-            if their_card:
-                self.window_history.append({
-                    "contestType": contest.get("contestType"),
-                    "round": world.round,
-                    "card": their_card,
-                    "won": beat.get("winnerId") == opp_id,
-                })
+
+        # 找出对手 teamId
+        red_team = contest.get("redTeamId") or (
+            "RED" if contest.get("redPlayerId") == pid else None)
+        blue_team = contest.get("blueTeamId") or (
+            "BLUE" if contest.get("bluePlayerId") == pid else None)
+        if not red_team:
+            red_team = "RED"
+        if not blue_team:
+            blue_team = "BLUE"
+        opp_team = red_team if red_team != my_team else blue_team
+
+        # 从 cards dict 提取对手出牌
+        cards = contest.get("cards") or {}
+        their_card = cards.get(opp_team)
+        if their_card:
+            winner = contest.get("winnerTeamId")
+            self.window_history.append({
+                "contestType": contest.get("contestType"),
+                "round": world.round,
+                "card": their_card,
+                "won": winner == opp_team,
+            })
 
     # ── 路径预测 ──
 

@@ -416,9 +416,9 @@ class DecisionEngine:
         bo = world.is_rush and (me.rush_tactic_used_count or 0) == 0
         bonus = 3 if bo else 0
         best = None
-        # 根据剩余好果动态调整搜索范围（保底 KEEP_GOOD_FRUIT_MIN 好果用于交付）
-        max_g = min(4, me.good_fruit - config.KEEP_GOOD_FRUIT_MIN)
-        max_b = min(4, me.bad_fruit)
+        # §6.3.1: 好果/坏果各最多 2 篓
+        max_g = min(2, me.good_fruit - config.KEEP_GOOD_FRUIT_MIN)
+        max_b = min(2, me.bad_fruit)
         for g in range(0, max_g + 1):
             if g > me.good_fruit or (me.good_fruit - g) < config.KEEP_GOOD_FRUIT_MIN:
                 continue
@@ -428,13 +428,6 @@ class DecisionEngine:
                 if g * 2 + b * 3 + bonus >= defense:
                     if best is None or (g, b) < (best[0], best[1]):
                         best = (g, b, bo)
-        if best is None and max_g >= 1 and max_b >= 3:
-            # 极端情况：高防守值设卡 + 有坏果，扩大搜索
-            for g in range(0, min(5, me.good_fruit - config.KEEP_GOOD_FRUIT_MIN) + 1):
-                for b in range(0, min(5, me.bad_fruit) + 1):
-                    if g * 2 + b * 3 + bonus >= defense:
-                        if best is None or (g, b) < (best[0], best[1]):
-                            best = (g, b, bo)
         return best
 
     # ---- 拒绝反馈（M7）----
@@ -645,8 +638,11 @@ class DecisionEngine:
         return None
 
     def _rush_speed_warranted(self, world, me, gm, node, terminal):
-        """疾行令：无马、远离终点、鲜度尚可时加速。"""
+        """疾行令：无马、远离终点、鲜度尚可时加速。成本 2 好果（任务书 §6.5）。"""
         if not world.is_rush or me.delivered or (me.rush_tactic_used_count or 0) > 0:
+            return None
+        # 好果不足（需保留 KEEP_GOOD_FRUIT_MIN 用于交付）→ 不浪费
+        if me.good_fruit < config.KEEP_GOOD_FRUIT_MIN + 2:
             return None
         # 鲜度低于护果阈值 → 优先留给护果令
         if me.freshness < config.RUSH_PROTECT_FRESHNESS_BELOW:
