@@ -62,18 +62,24 @@ def _make_our_factory(map_data, player_id, team_id):
     return factory
 
 
-def _make_opp_factory(opponent_class, player_id, team_id):
-    """创建对手工厂。"""
+def _make_opp_factory(opponent_class, map_data, player_id, team_id):
+    """创建对手工厂（闭包捕获 map_data，正确构建 GameMap）。"""
+    from core.game_map import GameMap
+    gm = GameMap(map_data)
+
     def factory():
         opp = opponent_class(player_id, team_id)
         class OpponentAdapter:
-            def __init__(self, opp):
+            def __init__(self, opp, gm):
                 self.opp = opp
-                self.ctx = type("Ctx", (), {"player_id": player_id, "game_map": None})()
+                self.ctx = type("Ctx", (), {"player_id": player_id, "game_map": gm})()
+                self._gm = gm
             def decide(self, world):
-                self.ctx.game_map = world.game_map
+                # 确保 WorldState 也有正确的 GameMap 引用
+                if world.game_map is None:
+                    world.game_map = self._gm
                 return self.opp.decide(world)
-        return OpponentAdapter(opp)
+        return OpponentAdapter(opp, gm)
     return factory
 
 
@@ -141,12 +147,12 @@ def run_tournament(opponent_names, map_data=None, matches_per_pair=10,
 
                 for swap_sides in (False, True):
                     if swap_sides:
-                        red_f = _make_opp_factory(opp_class, 1001, "RED")
+                        red_f = _make_opp_factory(opp_class, mdata, 1001, "RED")
                         blue_f = _make_our_factory(mdata, 1002, "BLUE")
                         our_side = "BLUE"
                     else:
                         red_f = _make_our_factory(mdata, 1001, "RED")
-                        blue_f = _make_opp_factory(opp_class, 1002, "BLUE")
+                        blue_f = _make_opp_factory(opp_class, mdata, 1002, "BLUE")
                         our_side = "RED"
 
                 server = DuelMockServer(

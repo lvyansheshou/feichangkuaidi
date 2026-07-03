@@ -102,8 +102,17 @@ class DecisionEngine:
                 return result
 
             if me.state in (PlayerState.MOVING, PlayerState.WAITING):
+                # P1-5: 先加速再检查窗口（MOVING 态优先移动效率）
                 horse = self._maybe_horse(me, gm, terminal)
-                result = [horse] if horse else []
+                if horse:
+                    result = [horse]
+                    return result
+                # 无加速需求时才处理窗口
+                card = self._window_card_adaptive(world, me)
+                if card:
+                    result = [card]
+                    return result
+                result = []
                 return result
             if me.state not in _IDLE_LIKE:
                 result = []
@@ -200,14 +209,42 @@ class DecisionEngine:
         path_b, cost_b = gm.time_optimal_path(src, dst, blocked=blocked)
         path_u, cost_u = gm.time_optimal_path(src, dst)
 
-        if path_b and len(path_b) > 1:
-            # 绕行 vs 清障权衡：绕行远比就地清障贵，且直路下一跳是可清障障碍 → 就地清障
-            if (path_u and len(path_u) > 1 and cost_b - cost_u > config.REROUTE_VS_CLEAR_EXTRA):
-                nxt_u = path_u[1]
-                ns = world.node(nxt_u)
-                if (ns and ns.has_obstacle and me.good_fruit > config.KEEP_GOOD_FRUIT_MIN
-                        and not self._is_cooldown(world, nxt_u)):
+        # P1-7: 天气预告感知 — 酷暑/山雾将至时倾向官道（低鲜度损耗）
+        upcoming = world.upcoming_weather(within_frames=30) if world else None
+        prefer_road = (upcoming and upcoming["type"] in ("HOT", "MOUNTAIN_FOG"))
+
+        if prefer_road and path_b and len(path_b) > 1:
+            # 检查 path_u（直路）是否大量走山路 → 如果是，倾向 path_b（绕行/官道）
+            u_types = self._path_route_types(gm, path_u)
+            b_types = self._path_route_types(gm, path_b)
+            u_mountain_ratio = sum(1 for t in u_types if t == "MOUNTAIN") / max(1, len(u_types))
+            b_mountain_ratio = sum(1 for t in b_types if t == "MOUNTAIN") / max(1, len(b_types))
+            # 直路多山路且绕行少山路 → 考虑绕行
+            if u_mountain_ratio > 0.3 and b_mountain_ratio < u_mountain_ratio - 0.1:
+                if cost_b - cost_u < 40:  # 绕行代价可接受
+                    return [actions.move(path_b[1])]
+
+        if path_b and len(path_b) > 1 and path_u and len(path_u) > 1:
+            nxt_u = path_u[1]
+            ns = world.node(nxt_u)
+
+            # P0-1: 下一跳有障碍 → 比较"清障直行" vs "绕行"的预估得分
+            if ns and ns.has_obstacle and not self._is_cooldown(world, nxt_u):
+                choice = self._compare_clear_vs_detour(
+                    world, me, gm, nxt_u, path_u, cost_u, path_b, cost_b)
+                if choice == "detour":
+                    speed = self._rush_speed_warranted(world, me, gm, src, terminal)
+                    if speed:
+                        return [speed]
+                    return [actions.move(path_b[1])]
+                if choice == "clear":
                     return self._breakthrough(world, me, gm, nxt_u, terminal)
+
+            # 绕行 vs 清障权衡
+            if (cost_b - cost_u > config.REROUTE_VS_CLEAR_EXTRA
+                    and me.good_fruit > config.KEEP_GOOD_FRUIT_MIN):
+                return self._breakthrough(world, me, gm, nxt_u, terminal)
+
             speed = self._rush_speed_warranted(world, me, gm, src, terminal)
             if speed:
                 return [speed]
@@ -217,6 +254,65 @@ class DecisionEngine:
         if not path_u or len(path_u) < 2:
             return []
         return self._breakthrough(world, me, gm, path_u[1], terminal)
+
+    def _compare_clear_vs_detour(self, world, me, gm, obstacle_node,
+                                  path_direct, cost_direct, path_detour, cost_detour):
+        """比较清障直行 vs 绕行：返回 'clear' / 'detour' / 'continue'。
+
+        综合帧数 + 鲜度损耗 + 好果成本，选预估得分更高的方案。
+        """
+        # 清障成本：6 帧 + 1 好果
+        clear_frames = 6
+        clear_good_cost = 1
+
+        # 直行路径总帧 = 清障帧 + 直行旅行帧
+        direct_total = clear_frames + cost_direct
+
+        # 绕行路径总帧
+        detour_total = cost_detour
+
+        # 鲜度差异：估算直行路径 vs 绕行路径的鲜度损耗
+        # 直行路径的路线类型（取第一条边）
+        direct_route = self._path_route_types(gm, path_direct)
+        detour_route = self._path_route_types(gm, path_detour)
+
+        direct_freshness = self._estimate_freshness_cost(direct_total, direct_route)
+        detour_freshness = self._estimate_freshness_cost(detour_total, detour_route)
+
+        # 折算为近似分: 1帧≈0.12分, 1好果≈1.8分, 1鲜度≈1.8分
+        direct_score_cost = (direct_total * 0.12 + clear_good_cost * 1.8
+                             + direct_freshness * 1.8)
+        detour_score_cost = detour_total * 0.12 + detour_freshness * 1.8
+
+        # 1.5 分容差（避免在极接近时反复横跳）
+        if detour_score_cost + 1.5 < direct_score_cost:
+            return "detour"
+        if direct_score_cost + 1.5 < detour_score_cost:
+            return "clear"
+        return "continue"  # 打平，走原逻辑
+
+    def _path_route_types(self, gm, path):
+        """返回路径各边的路线类型列表。"""
+        types = []
+        for i in range(len(path) - 1):
+            e = gm.edge_between(path[i], path[i + 1])
+            if e:
+                types.append(e.route_type)
+        return types
+
+    def _estimate_freshness_cost(self, frames, route_types):
+        """估算路径的鲜度损耗。"""
+        if not route_types:
+            return frames * 0.06  # 默认均值
+        # 按路线类型加权
+        from core.rules import FRESHNESS_LOSS_MOVE, FRESHNESS_LOSS_BASE
+        total_loss = 0.0
+        frames_per_edge = frames / len(route_types) if route_types else frames
+        for rt in route_types:
+            total_loss += frames_per_edge * FRESHNESS_LOSS_MOVE.get(rt, 0.065)
+        # 加上固定处理帧（估算 10%）
+        total_loss += frames * 0.1 * FRESHNESS_LOSS_BASE
+        return total_loss
 
     def _blocked_nodes(self, world, me):
         blocked = set()
@@ -282,15 +378,25 @@ class DecisionEngine:
         bo = world.is_rush and (me.rush_tactic_used_count or 0) == 0
         bonus = 3 if bo else 0
         best = None
-        for g in range(0, 3):
+        # 根据剩余好果动态调整搜索范围（保底 KEEP_GOOD_FRUIT_MIN 好果用于交付）
+        max_g = min(4, me.good_fruit - config.KEEP_GOOD_FRUIT_MIN)
+        max_b = min(4, me.bad_fruit)
+        for g in range(0, max_g + 1):
             if g > me.good_fruit or (me.good_fruit - g) < config.KEEP_GOOD_FRUIT_MIN:
                 continue
-            for b in range(0, 3):
+            for b in range(0, max_b + 1):
                 if b > me.bad_fruit:
                     continue
                 if g * 2 + b * 3 + bonus >= defense:
                     if best is None or (g, b) < (best[0], best[1]):
                         best = (g, b, bo)
+        if best is None and max_g >= 1 and max_b >= 3:
+            # 极端情况：高防守值设卡 + 有坏果，扩大搜索
+            for g in range(0, min(5, me.good_fruit - config.KEEP_GOOD_FRUIT_MIN) + 1):
+                for b in range(0, min(5, me.bad_fruit) + 1):
+                    if g * 2 + b * 3 + bonus >= defense:
+                        if best is None or (g, b) < (best[0], best[1]):
+                            best = (g, b, bo)
         return best
 
     # ---- 拒绝反馈（M7）----
@@ -363,17 +469,30 @@ class DecisionEngine:
     # ---- 收益子策略（M4）----
 
     def _freshness_rescue(self, me, world=None):
-        """阈值感知冰鉴使用。
+        """阈值感知 + 天气预告冰鉴使用。
 
-        优先在即将跌破 90/80/70/... 阈值前使用，最大化 +10 回血效用。
-        回退到固定阈值 ICE_BOX_USE_BELOW。
+        1. 酷暑预告 → 提前囤鲜度
+        2. 即将跌破 90/80/70/... 阈值 → 提前 3 帧预警
+        3. 兜底固定阈值
         """
         ice = me.resource_count(ResourceType.ICE_BOX)
         if ice <= 0 or me.freshness <= 0:
             return None
 
-        # 估算单帧鲜度损耗（保守取山路值）
+        # P1-7: 酷暑预告即将生效（15 帧内）→ 现在用冰鉴，鲜度撑过酷暑
+        if world is not None:
+            upcoming = world.upcoming_weather(within_frames=15)
+            if upcoming and upcoming["type"] == "HOT" and me.freshness < 88:
+                return actions.use_resource(ResourceType.ICE_BOX)
+
+        # 估算单帧鲜度损耗（考虑当前天气）
         est_loss = 0.07
+        if world is not None:
+            wt = world.active_weather_type()
+            if wt == "HOT":
+                est_loss = 0.105  # 0.07 × 1.5
+            elif wt == "HEAVY_RAIN":
+                est_loss = 0.09  # ~0.07 × 1.3
 
         # 检查是否将在 3 帧内跌破任一好果转坏阈值
         for threshold in (90, 80, 70, 60, 50, 40, 30, 20, 10):
@@ -609,8 +728,11 @@ class DecisionEngine:
         if not path:
             return None
         for i, nid in enumerate(path):
-            if i < config.SQUAD_AHEAD_MIN_HOPS:
-                continue  # 太近交给主车队突破（小分队延迟落地来不及）
+            # P1-6: 必经节点放宽到第 1 跳（小分队延迟落地 3-6 帧，
+            #       主车队走第一边需 50-100 帧，时间充足）
+            min_hops = 1 if gm.is_chokepoint(nid) else config.SQUAD_AHEAD_MIN_HOPS
+            if i < min_hops:
+                continue
             ns = world.node(nid)
             if ns and ns.has_obstacle:
                 return (nid, "obstacle")

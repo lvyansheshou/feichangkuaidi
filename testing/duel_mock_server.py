@@ -307,6 +307,8 @@ class DuelMockServer:
             # 处理完成效果
             if ptype == "fixed":
                 pass  # 固定处理完成
+            elif ptype == "verify":
+                c.verified = True  # 验核完成（修复：在 PROCESSING 结束时标记）
             elif ptype == "guard":
                 # 设卡完成
                 ns = self.node_states.get(c.current_node)
@@ -385,8 +387,7 @@ class DuelMockServer:
                         proc_round = max(2, proc_round - 3)
                     c.state = "PROCESSING"
                     c.processing_remaining = proc_round
-                    c.processing_type = "fixed"
-                    c.verified = True
+                    c.processing_type = "verify"  # 特殊类型，完成后标记 verified
 
             elif act == Action.DELIVER:
                 if (c.current_node in self.gm.terminal_nodes and c.verified
@@ -410,7 +411,10 @@ class DuelMockServer:
                     ns = self.node_states.get(tgt)
                     if ns:
                         ns.guard_extra_good = extra
-                    c.good_fruit -= (1 if self.gm.node(tgt) and self.gm.node(tgt).type == "KEY_PASS" else 0)
+                    # 设卡基础成本 1 好果 + extra（任务书 §6.2.1）
+                    base_cost = 1 if (self.gm.node(tgt) and
+                                      self.gm.node(tgt).type in ("KEY_PASS", "GATE")) else 0
+                    c.good_fruit -= (base_cost + extra)
 
             elif act == Action.CLAIM_RESOURCE and tgt:
                 if c.state == "IDLE" and tgt == c.current_node:
@@ -503,9 +507,9 @@ class DuelMockServer:
                         ns.guard_defense = max(0, ns.guard_defense - 2)
 
             elif act == Action.RUSH_SPEED:
-                if not c.rush_tactic_used and c.good_fruit >= 2:
+                # 疾行令不消耗果品（任务书 §6.5），但鲜度损耗 ×1.25
+                if not c.rush_tactic_used:
                     c.rush_tactic_used = True
-                    c.good_fruit -= 2
                     c.buffs.append({"type": "RUSH_SPEED", "remainingRound": 15})
 
             elif act == Action.RUSH_PROTECT:

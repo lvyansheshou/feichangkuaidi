@@ -186,10 +186,17 @@ class OpponentModel:
             self.posture = "racing"
             return self.posture
 
-        # 使用第一个必经节点作为参考点（如果 S10 存在则用 S10，否则用第一个 chokepoint）
-        ref_node = "S10" if "S10" in (gm.chokepoints or set()) else (
-            next(iter(gm.chokepoints - {terminal}), None) if gm.chokepoints else None
-        )
+        # 使用第一个必经节点作为参考点（动态检测，不硬编码）
+        ref_node = None
+        chokes = gm.chokepoints - {terminal} if gm.chokepoints else set()
+        if chokes:
+            # 取距离起点最近的必经节点（= 第一个必经节点）
+            best_dist = float("inf")
+            for cn in chokes:
+                _, d = gm.time_optimal_path(gm.start_node or my_node, cn)
+                if d < best_dist:
+                    best_dist = d
+                    ref_node = cn
         if ref_node is None:
             ref_node = terminal
 

@@ -201,6 +201,31 @@ class WorldState:
         act = self.active_weather()
         return act[0].get("type") if act else None
 
+    def forecast_weather(self):
+        """已预告但尚未生效的天气列表。
+
+        天气提前 30 帧预告（任务书 §2.5），用于提前调整路线和冰鉴时机。
+        返回: [{'type': str, 'startRound': int, 'duration': int}, ...]
+        """
+        forecasts = self.weather.get("forecast", []) or []
+        result = []
+        for f in forecasts:
+            result.append({
+                "type": f.get("type"),
+                "startRound": f.get("startRound", 0),
+                "duration": f.get("duration", 0),
+            })
+        return result
+
+    def upcoming_weather(self, within_frames=30):
+        """返回将在 within_frames 帧内生效的最近天气预告，无则 None。"""
+        current = self.round or 0
+        forecasts = self.forecast_weather()
+        upcoming = [f for f in forecasts
+                    if 0 < f["startRound"] - current <= within_frames]
+        upcoming.sort(key=lambda f: f["startRound"])
+        return upcoming[0] if upcoming else None
+
     # ---- 便捷（需 game_map）----
 
     def distance_to_gate(self):
