@@ -46,4 +46,5 @@ TASK_DETOUR_MAX_EXTRA_FRAMES = 70   # 绕路做任务允许的最大额外帧（
 REROUTE_VS_CLEAR_EXTRA = 20         # 绕行比直路多这么多帧时改为就地清障（清障≈6帧+1好果）
 SQUAD_AHEAD_MIN_HOPS = 2            # 小分队预清障/削弱要求阻塞位于路径第 N 跳之后（留延迟落地余量）
 ENABLE_OFFENSIVE = False            # 主动设卡/增援等进攻干扰（默认关闭：delivery-first，占用己方交付时间）
-FP_RETRY_LIMIT = 4                  # FORCED_PASS 连续失败上限（超过则 WAIT 等待对手交付/设卡风化）
+FP_RETRY_LIMIT = 4                  # FORCED_PASS 连续失败上限（超过则 WAIT）
+FP_RETRY_COOLDOWN = 30              # FORCED_PASS 冷却后重试间隔（帧）

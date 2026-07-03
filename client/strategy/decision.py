@@ -154,6 +154,9 @@ class DecisionEngine:
             return self._advance(world, me, gm, node, terminal, terminal)
 
         if node in gm.process_nodes and not self._processed_here:
+            # 窗口冷却检测：若 PROCESS 被窗口冷却拒绝，不盲重试
+            if self._is_window_cooldown(world, node):
+                return []  # WAIT 等冷却结束
             return [actions.process()]
 
         intel = self._maybe_intel(world, me, gm, node, terminal)
@@ -354,10 +357,16 @@ class DecisionEngine:
                                             rush_tactic=(Action.BREAK_ORDER if bo else None))]
 
             # M8: FORCED_PASS 退避机制
-            # 连续失败 ≥ FP_RETRY_LIMIT → 等待（对手可能交付/设卡风化）
             fails = self._fp_failures.get(nxt, 0)
             if fails >= config.FP_RETRY_LIMIT:
-                return []  # WAIT：等对手交付后 PASS 窗口自动弃权
+                # 周期性重试：每 FP_RETRY_COOLDOWN 帧重试一次（对手可能已交付/设卡风化）
+                if fails >= config.FP_RETRY_LIMIT + config.FP_RETRY_COOLDOWN:
+                    # 冷却期满，重置计数重试
+                    self._fp_failures.pop(nxt, None)
+                    self._fp_last_node = None
+                    return [actions.forced_pass(nxt)]
+                self._fp_failures[nxt] = fails + 1  # 继续 WAIT
+                return []
 
             self._fp_failures[nxt] = fails + 1
             self._fp_last_node = nxt
@@ -423,6 +432,18 @@ class DecisionEngine:
             tgt = la.get("targetNodeId")
             if tgt:
                 self._cooldown[tgt] = (world.round or 0) + config.REJECT_BLOCK_ROUNDS
+
+        # 窗口冷却拒绝检测：PROCESS/CLAIM_TASK/CLAIM_RESOURCE 被拒绝 → 进入冷却等待
+        _WINDOW_REJECT_ACTIONS = {Action.PROCESS, Action.CLAIM_TASK, Action.CLAIM_RESOURCE,
+                                  Action.VERIFY_GATE}
+        _WINDOW_REJECT_CODES = {"OBJECT_BUSY", "CONTEST_COOLDOWN", "ACTION_REJECTED",
+                                "TASK_LOCKED", "RESOURCE_LOCKED"}
+        if la.get("action") in _WINDOW_REJECT_ACTIONS and code in _WINDOW_REJECT_CODES:
+            node = world.me.current_node_id if world.me else None
+            if node:
+                # 进入冷却：18 帧不重试（对齐 DOCK/OBSTACLE 冷却上限）
+                self._window_node_skip[node] = (world.round or 0) + 18
+                self._last_contested_node = node
 
     def _detect_fp_result(self, world, last_action):
         """检测 FORCED_PASS 成败，维护退避计数器。
