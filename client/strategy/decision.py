@@ -1085,11 +1085,35 @@ class DecisionEngine:
     # ---- 小分队（M7：防御性预清障/削弱 + 探路宫门）----
 
     def _maybe_squad(self, world, me, gm, node, terminal):
-        if world.is_rush:
-            return None  # RUSH 禁止新派小分队
-        avail = me.squad_available or 0
+        """后期小分队最优分配。
 
-        # ★ 增援己方必经节点设卡（防守值<4 且对手尚未通过）
+        原则（按紧迫度）：
+        1. RUSH 前必须派出 SCOUT@gate（RUSH 后禁止新派）
+        2. 必经节点设卡需要 REINFORCE 维持防守值
+        3. 前方障碍 CLEAR 保护好果
+        4. 敌方设卡 WEAKEN 降低突破成本
+        5. 所有 8 人手在 RUSH 前用完
+        """
+        if world.is_rush:
+            return None
+        avail = me.squad_available or 0
+        if avail <= 0:
+            return None
+
+        # 估算距 RUSH 的帧数（最早 frame 390）
+        frames_to_rush = max(0, 390 - (world.round or 0))
+
+        # ★ 紧迫：距 RUSH < 50 帧且未派 SCOUT → 最高优先级
+        if frames_to_rush < 50 and avail >= 1:
+            scout = self._maybe_scout_gate(world, me, gm, node)
+            if scout:
+                return scout
+
+        # ★ 距 RUSH < 30 帧：清仓（用掉所有剩余人手）
+        if frames_to_rush < 30:
+            return self._squad_clearance(world, me, gm, node, terminal, avail)
+
+        # 正常优先级：REINFORCE > CLEAR > WEAKEN > SCOUT
         if avail >= 2:
             reinforce = self._maybe_reinforce_own_guard(world, me, gm)
             if reinforce:
@@ -1106,6 +1130,45 @@ class DecisionEngine:
                         return actions.squad_clear(nid)
                     if kind == "guard":
                         return actions.squad_weaken(nid)
+
+        # 有余裕 → 探路宫门（_maybe_scout_gate 自带距离窗口检查）
+        if avail >= 1:
+            return self._maybe_scout_gate(world, me, gm, node)
+
+        return None
+
+    def _squad_clearance(self, world, me, gm, node, terminal, avail):
+        """RUSH 前清仓：最优使用剩余人手。
+
+        剩余 4+: SCOUT(1) + 最佳 CLEAR/REINFORCE(2) = 3
+        剩余 3:  SCOUT(1) + CLEAR(2) = 3 或 SCOUT(1) 剩2浪费
+        剩余 2:  最佳 CLEAR/REINFORCE/WEAKEN(2)
+        剩余 1:  SCOUT(1)
+        """
+        # SCOUT 必须派（如果还没派）
+        if not self._gate_scout_sent and avail >= 1:
+            scout = self._maybe_scout_gate(world, me, gm, node)
+            if scout and avail >= 3:
+                return scout  # 有余裕，先派 SCOUT
+            if scout and avail < 3:
+                return scout  # 人手不够做别的，派 SCOUT
+
+        # 找最佳 CLEAR/REINFORCE/WEAKEN 目标
+        if avail >= 2:
+            reinforce = self._maybe_reinforce_own_guard(world, me, gm)
+            if reinforce:
+                return reinforce
+            blk = self._first_block_ahead(world, me, gm, node, terminal)
+            if blk:
+                nid, kind = blk
+                key = (nid, kind)
+                if key not in self._squad_sent:
+                    self._squad_sent.add(key)
+                    if kind == "obstacle":
+                        return actions.squad_clear(nid)
+                    if kind == "guard":
+                        return actions.squad_weaken(nid)
+
         return self._maybe_scout_gate(world, me, gm, node)
 
     def _maybe_reinforce_own_guard(self, world, me, gm):
