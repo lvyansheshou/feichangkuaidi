@@ -63,6 +63,12 @@ class OpponentModel:
         self.lead_frames = 0             # 正=我方领先帧数，负=落后
         self.posture = "racing"          # racing / leading / trailing / contested / sprinting
 
+        # 资源消耗追踪
+        self.guard_points_used = 0       # 已用护卫行动点
+        self.squad_used = 0              # 已用小分队人手
+        self.rush_tactic_used_flag = False
+        self.ice_boxes_used = 0          # 估算已用冰鉴数
+
     # ── 每帧更新 ──
 
     def update(self, world):
@@ -89,6 +95,17 @@ class OpponentModel:
         self.guard_action_point = opp.guard_action_point or 0
         self.delivered = opp.delivered
         self.rush_tactic_used = (opp.rush_tactic_used_count or 0) > 0
+
+        # 资源消耗追踪（累计使用量）
+        self.guard_points_used = max(self.guard_points_used,
+                                     4 - (opp.guard_action_point or 0))
+        self.squad_used = max(self.squad_used,
+                              8 - (opp.squad_available or 0))
+        # 冰鉴使用：鲜度突然 +10 → 使用了一次
+        if hasattr(self, '_last_opp_freshness') and self._last_opp_freshness is not None:
+            if opp.freshness - self._last_opp_freshness > 5:
+                self.ice_boxes_used += 1
+        self._last_opp_freshness = opp.freshness
 
         # 检测对手设卡
         for nid, ns in world.node_states.items():

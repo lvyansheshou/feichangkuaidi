@@ -136,7 +136,13 @@ class DecisionEngine:
             if me.verified and me.good_fruit > 0 and me.freshness > 0:
                 return [actions.deliver()]
             if not me.verified and gate:
+                # S15→S14 特殊返回：无视设卡和障碍（任务书 §2.3.1）
+                if gate in gm.neighbors(node):
+                    return [actions.move(gate)]
                 return self._advance(world, me, gm, node, gate, terminal)
+            # 已验核但不满足交付条件 → WAIT 或返回 S14
+            if me.verified and gate and gate in gm.neighbors(node):
+                return [actions.move(gate)]
             return []
 
         if gate and node == gate:
@@ -209,11 +215,22 @@ class DecisionEngine:
 
     def _advance(self, world, me, gm, src, dst, terminal):
         blocked = self._blocked_nodes(world, me)
-        path_b, cost_b = gm.time_optimal_path(src, dst, blocked=blocked)
-        path_u, cost_u = gm.time_optimal_path(src, dst)
 
-        # P1-7: 天气预告感知 — 酷暑/山雾将至时倾向官道（低鲜度损耗）
+        # ★ 天气感知路由：当前天气 + 预告天气影响边权
+        active_wt = world.active_weather_type() if world else None
         upcoming = world.upcoming_weather(within_frames=30) if world else None
+
+        # 当前有天气 → 用天气感知路径
+        if active_wt in ("HOT", "HEAVY_RAIN", "MOUNTAIN_FOG"):
+            path_b, cost_b = gm.weather_adjusted_path(
+                src, dst, weather_type=active_wt, blocked=blocked)
+            path_u, cost_u = gm.weather_adjusted_path(
+                src, dst, weather_type=active_wt)
+        else:
+            path_b, cost_b = gm.time_optimal_path(src, dst, blocked=blocked)
+            path_u, cost_u = gm.time_optimal_path(src, dst)
+
+        # 天气预告感知 — 酷暑/山雾将至时倾向官道
         prefer_road = (upcoming and upcoming["type"] in ("HOT", "MOUNTAIN_FOG"))
 
         if prefer_road and path_b and len(path_b) > 1:
@@ -349,23 +366,24 @@ class DecisionEngine:
 
         owner = ns.active_guard_owner() if ns else None
         if owner and owner != me.team_id:
+            # ★ 悬赏狩猎：必经节点的敌方设卡可能有悬赏
+            bounty_value = self._check_bounty(world, nxt)
             plan = self._plan_attack(world, me, ns)
             if plan is not None:
                 self._fp_failures.pop(nxt, None)  # 攻坚重置 FORCED_PASS 计数
                 g, b, bo = plan
+                # 有悬赏时优先攻坚（即使代价稍高）
                 return [actions.break_guard(nxt, good_fruit=g, bad_fruit=b,
                                             rush_tactic=(Action.BREAK_ORDER if bo else None))]
 
             # M8: FORCED_PASS 退避机制
             fails = self._fp_failures.get(nxt, 0)
             if fails >= config.FP_RETRY_LIMIT:
-                # 周期性重试：每 FP_RETRY_COOLDOWN 帧重试一次（对手可能已交付/设卡风化）
                 if fails >= config.FP_RETRY_LIMIT + config.FP_RETRY_COOLDOWN:
-                    # 冷却期满，重置计数重试
                     self._fp_failures.pop(nxt, None)
                     self._fp_last_node = None
                     return [actions.forced_pass(nxt)]
-                self._fp_failures[nxt] = fails + 1  # 继续 WAIT
+                self._fp_failures[nxt] = fails + 1
                 return []
 
             self._fp_failures[nxt] = fails + 1
@@ -379,6 +397,17 @@ class DecisionEngine:
             if t.get("taskTemplateId") == "T04" and t.get("nodeId") == node:
                 return t
         return None
+
+    def _check_bounty(self, world, node_id):
+        """检查节点是否有可结算的破关悬赏。
+
+        返回悬赏分值（0=无悬赏）。关键关隘 18 分，普通 10 分。
+        """
+        for b in (world.bounties or []):
+            if b.get("nodeId") == node_id and not b.get("claimed"):
+                btype = b.get("type", "")
+                return 18 if btype == "KEY_BOUNTY" else 10
+        return 0
 
     def _plan_attack(self, world, me, ns):
         defense = (ns.guard or {}).get("defense", 0) or 0
@@ -607,17 +636,22 @@ class DecisionEngine:
         return actions.use_resource(horse)
 
     def _maybe_rush_protect(self, world, me):
+        """护果令：鲜度低时保鲜 30 帧 (×0.2)。鲜度高时不浪费急策。"""
         if not world.is_rush or me.delivered or (me.rush_tactic_used_count or 0) > 0:
             return None
-        if me.freshness < config.RUSH_PROTECT_FRESHNESS_BELOW:
+        # 鲜度 < 阈值且不是特别高（>95 时不值得用）
+        if config.RUSH_PROTECT_FRESHNESS_BELOW > me.freshness > 50:
             return actions.rush_protect()
         return None
 
     def _rush_speed_warranted(self, world, me, gm, node, terminal):
+        """疾行令：无马、远离终点、鲜度尚可时加速。"""
         if not world.is_rush or me.delivered or (me.rush_tactic_used_count or 0) > 0:
             return None
+        # 鲜度低于护果阈值 → 优先留给护果令
         if me.freshness < config.RUSH_PROTECT_FRESHNESS_BELOW:
             return None
+        # 已有马或离终点近 → 不浪费
         if self._has_any_horse(me) or not self._far_from_terminal(gm, node, terminal):
             return None
         return actions.rush_speed()
@@ -729,6 +763,13 @@ class DecisionEngine:
         if world.is_rush:
             return None  # RUSH 禁止新派小分队
         avail = me.squad_available or 0
+
+        # ★ 增援己方必经节点设卡（防守值<4 且对手尚未通过）
+        if avail >= 2:
+            reinforce = self._maybe_reinforce_own_guard(world, me, gm)
+            if reinforce:
+                return reinforce
+
         if avail >= 2:
             blk = self._first_block_ahead(world, me, gm, node, terminal)
             if blk:
@@ -741,6 +782,31 @@ class DecisionEngine:
                     if kind == "guard":
                         return actions.squad_weaken(nid)
         return self._maybe_scout_gate(world, me, gm, node)
+
+    def _maybe_reinforce_own_guard(self, world, me, gm):
+        """增援我方在必经节点的设卡（防守薄弱时）。
+
+        条件：设卡防守值 ≤ 4，对手尚未通过该节点。
+        效果：防守值 +2，延长风化寿命 30+ 帧。
+        """
+        for nid, ns in world.node_states.items():
+            if not gm.is_chokepoint(nid):
+                continue
+            owner = ns.active_guard_owner()
+            if owner != me.team_id:
+                continue
+            defense = (ns.guard or {}).get("defense", 0) or 0
+            if defense <= 0 or defense > 4:
+                continue
+            # 对手尚未通过
+            if self.opponent.has_passed(nid):
+                continue
+            key = (nid, "reinforce")
+            if key in self._squad_sent:
+                continue
+            self._squad_sent.add(key)
+            return actions.squad_reinforce(nid)
+        return None
 
     def _first_block_ahead(self, world, me, gm, node, terminal):
         if not terminal:

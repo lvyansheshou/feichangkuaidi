@@ -198,6 +198,35 @@ class GameMap:
             return 0
         return info.get("processRound", 0) or 0
 
+    def weather_adjusted_path(self, source, target, weather_type=None,
+                               base_move=None, blocked=None):
+        """天气感知最短路 (path, frames)。
+
+        根据 forecast/report 的天气类型调整边权：
+        - HOT: 全图 ×1.5 鲜度 → 倾向短路径（少帧=少损耗）
+        - HEAVY_RAIN: WATER 边 ×1.35 速度倍率 → WATER 边权加重
+        - MOUNTAIN_FOG: MOUNTAIN 边 ×1.1 速度倍率 → MOUNTAIN 边权加重
+        """
+        bm = rules.BASE_MOVE_NONE if base_move is None else base_move
+        blocked = blocked or frozenset()
+
+        adj = {}
+        for e in self.edges:
+            weather_mult = 1000
+            if weather_type == "HEAVY_RAIN" and e.route_type == "WATER":
+                weather_mult = 1350
+            elif weather_type == "MOUNTAIN_FOG" and e.route_type == "MOUNTAIN":
+                weather_mult = 1100
+
+            base = rules.frames_on_edge(e.distance, e.route_type, bm, weather_mult)
+            if e.to_node not in blocked:
+                adj.setdefault(e.from_node, []).append(
+                    (e.to_node, base + self._proc_cost(e.to_node)))
+            if e.bidirectional and e.from_node not in blocked:
+                adj.setdefault(e.to_node, []).append(
+                    (e.from_node, base + self._proc_cost(e.from_node)))
+        return pathfind.shortest_path(adj, source, target)
+
     def route_distance(self, source, target):
         """最短路线距离（累计边 distance 之和）；用于情报/冲刺等距离口径。不可达返回 inf。"""
         _, cost = self.shortest_path(source, target, metric="distance")
