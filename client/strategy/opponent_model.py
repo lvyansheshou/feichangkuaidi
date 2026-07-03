@@ -365,6 +365,12 @@ class OpponentModel:
         if self.posture in ("trailing", "contested", "sprinting"):
             return False
 
+        # ★ 设卡时机优化：对手 ETA ≤ 设卡处理帧数 → 不设卡
+        # （设卡需 4 帧处理，对手在 4 帧内到达则可以 MOVE 通过，设卡白费）
+        opp_eta = self.estimate_eta_to(gm, node_id)
+        if opp_eta is not None and opp_eta <= 5:
+            return False
+
         # 必经节点检查
         if not gm.is_chokepoint(node_id):
             return False

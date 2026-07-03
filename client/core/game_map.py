@@ -198,6 +198,91 @@ class GameMap:
             return 0
         return info.get("processRound", 0) or 0
 
+    def enumerate_paths(self, source, target, max_paths=3, blocked=None):
+        """枚举 source→target 的前 max_paths 条最短路径（按帧数）。
+
+        用于多维度评分：不只比帧数，综合鲜度/资源/任务选择最优路径。
+        使用 Yen's 算法简化版：逐条排除已选路径的边，找次短路。
+        """
+        blocked = blocked or frozenset()
+        paths = []
+        excluded_edges = set()
+
+        for _ in range(max_paths):
+            adj = {}
+            for e in self.edges:
+                if (e.from_node, e.to_node) in excluded_edges:
+                    continue
+                base = rules.frames_on_edge(e.distance, e.route_type, rules.BASE_MOVE_NONE)
+                if e.to_node not in blocked:
+                    adj.setdefault(e.from_node, []).append(
+                        (e.to_node, base + self._proc_cost(e.to_node)))
+                if e.bidirectional and e.from_node not in blocked:
+                    adj.setdefault(e.to_node, []).append(
+                        (e.from_node, base + self._proc_cost(e.from_node)))
+            path, cost = pathfind.shortest_path(adj, source, target)
+            if not path:
+                break
+            if path not in paths:
+                paths.append((path, cost))
+            # 排除第一条边找次短路
+            if len(path) >= 2:
+                excluded_edges.add((path[0], path[1]))
+        return paths
+
+    def score_path(self, path, resource_nodes=None, task_nodes=None):
+        """对路径打分（越低越好）。
+
+        综合维度：
+        - frames: 总帧数（权重 1.0）
+        - freshness: 估算鲜度损耗（权重 1.8，1鲜度≈1.8分）
+        - resources: 沿途资源点数量（奖励 -2/个）
+        - tasks: 沿途任务候选点数量（奖励 -3/个）
+        """
+        if not path or len(path) < 2:
+            return float("inf")
+
+        # 帧数
+        total_frames = 0
+        for i in range(len(path) - 1):
+            e = self.edge_between(path[i], path[i + 1])
+            if e:
+                total_frames += rules.frames_on_edge(e.distance, e.route_type,
+                                                     rules.BASE_MOVE_NONE)
+                total_frames += self._proc_cost(path[i + 1])
+
+        # 鲜度损耗
+        freshness_loss = 0.0
+        for i in range(len(path) - 1):
+            e = self.edge_between(path[i], path[i + 1])
+            if e:
+                frames = rules.frames_on_edge(e.distance, e.route_type,
+                                              rules.BASE_MOVE_NONE)
+                rate = rules.FRESHNESS_LOSS_MOVE.get(e.route_type, 0.065)
+                freshness_loss += frames * rate
+        # 处理帧的基础损耗
+        proc_frames = sum(self._proc_cost(n) for n in path[1:])
+        freshness_loss += proc_frames * rules.FRESHNESS_LOSS_BASE
+
+        # 资源奖励
+        resource_bonus = 0
+        if resource_nodes:
+            for n in path:
+                if n in resource_nodes:
+                    resource_bonus -= 2  # 有资源 -2（好于无资源）
+
+        # 任务奖励
+        task_bonus = 0
+        if task_nodes:
+            for n in path:
+                if n in task_nodes:
+                    task_bonus -= 3
+
+        # 综合分 = 帧(权重1) + 鲜度(权重30, 1鲜度≈1.8分/0.06帧) + 资源 + 任务
+        FRESHNESS_WEIGHT = 30.0
+        score = total_frames + freshness_loss * FRESHNESS_WEIGHT + resource_bonus + task_bonus
+        return score
+
     def weather_adjusted_path(self, source, target, weather_type=None,
                                base_move=None, blocked=None):
         """天气感知最短路 (path, frames)。

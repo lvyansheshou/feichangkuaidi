@@ -173,10 +173,14 @@ class DecisionEngine:
         if rp:
             return [rp]
 
+        # ★ 控场区感知：进入 S08-S10 区域 → 评估抢先策略
+        in_control_zone = self._in_control_zone(gm, node)
+        if in_control_zone and self.opponent.posture == "contested":
+            # 胶着态 + 控场区 → 抢先冲刺，放弃任务/资源
+            dst = terminal
+            return self._advance(world, me, gm, node, dst, terminal)
+
         # M8: 态势感知任务优先级
-        # leading → 保持领先，不做耗时任务
-        # trailing → 激进做任务（需要追分）
-        # racing/contested → 机会式
         opp = self._opportunistic(world, me, gm, node, terminal)
         if opp:
             return opp
@@ -215,6 +219,19 @@ class DecisionEngine:
 
     def _advance(self, world, me, gm, src, dst, terminal):
         blocked = self._blocked_nodes(world, me)
+
+        # ★ 多路径评分：仅在任务分<90时做多维度选路（有任务收益时才值得偏离最短路）
+        if ((src == gm.start_node or len(gm.neighbors(src)) >= 3)
+                and not blocked and (me.task_score or 0) < 90):
+            best_path = self._select_best_path(world, me, gm, src, dst, blocked)
+            if best_path and len(best_path) > 1:
+                nxt = best_path[1]
+                nxt_ns = world.node(nxt)
+                # 下一跳有障碍但非冷却 → 跳过评分，走原有突破逻辑
+                if not (nxt_ns and nxt_ns.has_obstacle
+                        and not self._is_cooldown(world, nxt)):
+                    if nxt not in blocked:
+                        return [actions.move(nxt)]
 
         # ★ 天气感知路由：当前天气 + 预告天气影响边权
         active_wt = world.active_weather_type() if world else None
@@ -310,6 +327,43 @@ class DecisionEngine:
         if direct_score_cost + 1.5 < detour_score_cost:
             return "clear"
         return "continue"  # 打平，走原逻辑
+
+    def _select_best_path(self, world, me, gm, src, dst, blocked):
+        """多维度路径选择：枚举候选路径，综合评分选最优。
+
+        仅当存在 2+ 条路径且帧数差 ≤ 60 时才做多维度比较（真正有选择余地）。
+        否则回退到 time_optimal_path（最短帧数）。
+        """
+        paths = gm.enumerate_paths(src, dst, max_paths=3, blocked=blocked)
+        if not paths or len(paths) < 2:
+            return paths[0][0] if paths else None
+
+        # 帧数差太大 → 没有真正选择，直接选最短
+        frames_list = [c for _, c in paths]
+        if max(frames_list) - min(frames_list) > 60:
+            return paths[0][0]  # 最短帧数路径
+
+        # 帧数接近 → 多维度评分
+        resource_nodes = set()
+        task_nodes = set()
+        for nid, ns in world.node_states.items():
+            if ns.resource_stock:
+                resource_nodes.add(nid)
+        for t in (world.active_tasks() if hasattr(world, 'active_tasks') else []):
+            task_nodes.add(t.get("nodeId"))
+
+        best_path, best_score = None, float("inf")
+        for path, frames in paths:
+            score = gm.score_path(path, resource_nodes, task_nodes)
+            for n in path:
+                ns = world.node(n)
+                if ns and ns.has_obstacle:
+                    score += 15
+            if score < best_score:
+                best_score = score
+                best_path = path
+
+        return best_path
 
     def _path_route_types(self, gm, path):
         """返回路径各边的路线类型列表。"""
@@ -610,6 +664,31 @@ class DecisionEngine:
         """对手是否在同一节点。"""
         opp = world.opponent
         return opp is not None and opp.current_node_id == node
+
+    def _in_control_zone(self, gm, node):
+        """是否进入控场区（S08-S10 区域，即第一个必经节点附近）。
+
+        进入此区域后，抢先到达 S10 比做任务/收集资源更重要。
+        """
+        chokes = gm.chokepoints
+        if not chokes:
+            return False
+        # 找到第一个必经节点
+        terminal = gm.terminal_nodes[0] if gm.terminal_nodes else None
+        first_choke = None
+        best_dist = float("inf")
+        for cn in chokes:
+            if cn == terminal:
+                continue
+            _, d = gm.time_optimal_path(gm.start_node, cn)
+            if d < best_dist:
+                best_dist = d
+                first_choke = cn
+        if not first_choke:
+            return False
+        # 当前节点距离第一个必经节点 ≤ 2 跳 → 在控场区
+        _, dist = gm.time_optimal_path(node, first_choke)
+        return dist != float("inf") and dist <= 150  # ~2 条边的帧数
 
     def _is_window_cooldown(self, world, node):
         """当前节点是否处于窗口冷却期（刚从此节点窗口出来）。"""
