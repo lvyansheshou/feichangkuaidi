@@ -354,39 +354,32 @@ class DecisionEngine:
 
     def _compare_clear_vs_detour(self, world, me, gm, obstacle_node,
                                   path_direct, cost_direct, path_detour, cost_detour):
-        """比较清障直行 vs 绕行：返回 'clear' / 'detour' / 'continue'。
+        """比较清障直行 vs 绕行：直接用 estimate_delivery_score。
 
-        综合帧数 + 鲜度损耗 + 好果成本，选预估得分更高的方案。
+        返回 'clear' / 'detour' / 'continue'。
         """
-        # 清障成本：6 帧 + 1 好果
-        clear_frames = 6
-        clear_good_cost = 1
+        # 直行路径：当前节点 → 清障(6帧,-1好果) → 直行路径
+        direct_score, _, _, _ = gm.estimate_delivery_score(
+            path_direct,
+            start_freshness=me.freshness,
+            start_good_fruit=me.good_fruit - 1,  # 清障成本
+        )
+        # 清障帧数惩罚
+        direct_score -= 6 * 0.12  # ~0.7 分
 
-        # 直行路径总帧 = 清障帧 + 直行旅行帧
-        direct_total = clear_frames + cost_direct
+        # 绕行路径
+        detour_score, _, _, _ = gm.estimate_delivery_score(
+            path_detour,
+            start_freshness=me.freshness,
+            start_good_fruit=me.good_fruit,  # 无好果损失
+        )
 
-        # 绕行路径总帧
-        detour_total = cost_detour
-
-        # 鲜度差异：估算直行路径 vs 绕行路径的鲜度损耗
-        # 直行路径的路线类型（取第一条边）
-        direct_route = self._path_route_types(gm, path_direct)
-        detour_route = self._path_route_types(gm, path_detour)
-
-        direct_freshness = self._estimate_freshness_cost(direct_total, direct_route)
-        detour_freshness = self._estimate_freshness_cost(detour_total, detour_route)
-
-        # 折算为近似分: 1帧≈0.12分, 1好果≈1.8分, 1鲜度≈2.5分（加重）
-        direct_score_cost = (direct_total * 0.12 + clear_good_cost * 1.8
-                             + direct_freshness * 2.5)
-        detour_score_cost = detour_total * 0.12 + detour_freshness * 2.5
-
-        # 1.5 分容差（避免在极接近时反复横跳）
-        if detour_score_cost + 1.5 < direct_score_cost:
+        # 2 分容差
+        if detour_score > direct_score + 2:
             return "detour"
-        if direct_score_cost + 1.5 < detour_score_cost:
+        if direct_score > detour_score + 2:
             return "clear"
-        return "continue"  # 打平，走原逻辑
+        return "continue"
 
     def _select_strategic_path(self, world, me, gm, src, dst, blocked):
         """基于文档公式的得分驱动路径选择。
@@ -425,28 +418,38 @@ class DecisionEngine:
             for t in (world.active_tasks() if hasattr(world, 'active_tasks') else []):
                 task_nodes.add(t.get("nodeId"))
 
-        best_path, best_score = None, float("inf")
-        for path, frames in paths:
-            score = frames * FRAME_W
-            freshness_loss = self._estimate_freshness_cost(
-                frames, self._path_route_types(gm, path))
-            score += freshness_loss * FRESH_W
+        # ★ 直接用任务书公式预估每条路径的交付总分
+        best_path, best_score = None, -1
+        task_done = (self._task_base >= 90 or (me.task_score or 0) >= 90)
+        task_base_est = self._task_base
+        if not task_done:
+            # 粗略估算沿途能做几个任务
+            on_path_tasks = sum(1 for n in (
+                set(p for p in (paths[0][0] if paths else []) if p in task_nodes)
+            ))
+            task_base_est += on_path_tasks * 20  # 保守估计每个20分
 
+        for path, frames in paths:
+            est_score, end_fresh, end_good, _ = gm.estimate_delivery_score(
+                path,
+                start_freshness=me.freshness,
+                start_good_fruit=me.good_fruit,
+                start_task_base=min(task_base_est, 90),
+                start_bounty=me.bounty_score or 0,
+            )
+
+            # 路径风险调整
             for n in path:
-                if n in resource_nodes:
-                    score += RES_BONUS
-                if n in task_nodes:
-                    score += TASK_BONUS
                 ns = world.node(n)
                 if ns and ns.has_obstacle:
-                    score += 15
+                    est_score -= 3  # 障碍风险：-1好果≈1.8分 + 6帧≈0.7分
                 if n in opp_visited and n not in (gm.start_node,):
-                    score += 30
+                    est_score -= 5  # 对手设卡风险
                 if self.opponent.posture == "contested" and n in opp_route_nodes:
-                    score += 10
+                    est_score -= 3  # 正面冲突风险
 
-            if score < best_score:
-                best_score = score
+            if est_score > best_score:
+                best_score = est_score
                 best_path = path
 
         return best_path

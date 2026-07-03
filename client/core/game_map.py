@@ -230,6 +230,48 @@ class GameMap:
                 excluded_edges.add((path[0], path[1]))
         return paths
 
+    def estimate_delivery_score(self, path, start_freshness=100.0, start_good_fruit=100,
+                                  start_task_base=0, start_bounty=0):
+        """直接预估走完此路径后的交付总分（任务书 §7.2 公式）。
+
+        逐帧模拟鲜度损耗 + 阈值穿越检测，捕捉 NON-linear 的好果转坏效应。
+        返回: (estimated_score, end_freshness, end_good_fruit, total_frames)
+        """
+        if not path or len(path) < 2:
+            return 0, start_freshness, start_good_fruit, 0
+
+        total_frames = 0
+        freshness = start_freshness
+        good_fruit = start_good_fruit
+
+        for i in range(len(path) - 1):
+            e = self.edge_between(path[i], path[i + 1])
+            if not e:
+                continue
+            edge_frames = rules.frames_on_edge(e.distance, e.route_type,
+                                               rules.BASE_MOVE_NONE)
+            rate = rules.FRESHNESS_LOSS_MOVE.get(e.route_type, 0.065)
+            for _ in range(edge_frames):
+                before = freshness
+                freshness = max(0, before - rate)
+                for _ in rules.crossed_good_to_bad_thresholds(before, freshness):
+                    if good_fruit > 0:
+                        good_fruit -= 1
+            total_frames += edge_frames
+            proc = self._proc_cost(path[i + 1])
+            for _ in range(proc):
+                before = freshness
+                freshness = max(0, before - rules.FRESHNESS_LOSS_BASE)
+                for _ in rules.crossed_good_to_bad_thresholds(before, freshness):
+                    if good_fruit > 0:
+                        good_fruit -= 1
+            total_frames += proc
+
+        from strategy.scoring import estimate_total
+        score = estimate_total(total_frames, good_fruit, freshness,
+                               start_task_base, start_bounty)
+        return score, freshness, good_fruit, total_frames
+
     def score_path(self, path, resource_nodes=None, task_nodes=None):
         """对路径打分（越低越好）。
 
