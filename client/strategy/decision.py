@@ -67,6 +67,10 @@ class DecisionEngine:
         self.opponent = OpponentModel()
         self._fp_failures = {}       # nodeId -> FORCED_PASS 连续失败次数（退避用）
         self._fp_last_node = None    # 上次尝试 FORCED_PASS 的目标节点
+        # 窗口争夺优化
+        self._window_rounds = 0      # 连续参与窗口的帧数
+        self._last_contested_node = None  # 上次触发窗口的节点
+        self._window_node_skip = {}  # nodeId -> 跳过资源/任务直到此回合
 
     def decide(self, world):
         me = world.me
@@ -299,6 +303,10 @@ class DecisionEngine:
         # M8: 检测 FORCED_PASS 结果
         self._detect_fp_result(world, la)
 
+        # 检测窗口退出：如果上帧在窗口争夺，本帧不在 → 记录冷却
+        if self._prev_state == PlayerState.CONTESTING and world.me.state != PlayerState.CONTESTING:
+            self._mark_window_cooldown(world, world.me)
+
         code = self._my_reject_code(world)
         if not code:
             return
@@ -378,6 +386,13 @@ class DecisionEngine:
         return None
 
     def _maybe_task(self, world, me, gm, node, terminal):
+        # 窗口回避：如果对手在同节点，跳过（避免触发 TASK 窗口争夺）
+        if self._opponent_at_same_node(world, node):
+            return None
+        # 窗口冷却：刚从此节点窗口出来，不重试
+        if self._is_window_cooldown(world, node):
+            return None
+
         pid = self.ctx.player_id
         for t in world.active_tasks():
             if t.get("nodeId") != node:
@@ -397,25 +412,47 @@ class DecisionEngine:
         return None
 
     def _maybe_claim(self, world, me, gm, node, terminal):
+        # 窗口回避：如果对手在同节点，只拿高价值资源（冰鉴/快马），其他跳过
+        opponent_here = self._opponent_at_same_node(world, node)
+        if self._is_window_cooldown(world, node):
+            return None
+
         ns = world.node(node)
         if ns is None:
             return None
         wants = []
+
+        # 冰鉴：鲜度保护刚需，即使对手也在也值得争
         if me.resource_count(ResourceType.ICE_BOX) < config.CLAIM_ICE_BOX_KEEP \
                 and ns.resource_available(ResourceType.ICE_BOX):
             wants.append(ResourceType.ICE_BOX)
-        if me.resource_count(ResourceType.INTEL) < 1 and ns.resource_available(ResourceType.INTEL) \
+        # 情报：仅对手不在时才领
+        if not opponent_here and me.resource_count(ResourceType.INTEL) < 1 \
+                and ns.resource_available(ResourceType.INTEL) \
                 and self._intel_usable_ahead(world, me, gm, node, terminal):
             wants.append(ResourceType.INTEL)
+        # 马：仅在对手不在或我们领先较多时才争
         if not self._has_any_horse(me) and self._far_from_terminal(gm, node, terminal):
             if ns.resource_available(ResourceType.FAST_HORSE):
-                wants.append(ResourceType.FAST_HORSE)
+                if not opponent_here or self.opponent.posture == "leading":
+                    wants.append(ResourceType.FAST_HORSE)
             elif ns.resource_available(ResourceType.SHORT_HORSE):
-                wants.append(ResourceType.SHORT_HORSE)
+                if not opponent_here or self.opponent.posture == "leading":
+                    wants.append(ResourceType.SHORT_HORSE)
         for r in wants:
             if self._can_afford(world, gm, node, config.RESOURCE_CLAIM_ROUND, terminal):
                 return actions.claim_resource(node, r)
         return None
+
+    def _opponent_at_same_node(self, world, node):
+        """对手是否在同一节点。"""
+        opp = world.opponent
+        return opp is not None and opp.current_node_id == node
+
+    def _is_window_cooldown(self, world, node):
+        """当前节点是否处于窗口冷却期（刚从此节点窗口出来）。"""
+        rnd = world.round or 0
+        return self._window_node_skip.get(node, 0) > rnd
 
     def _maybe_horse(self, me, gm, terminal):
         if self._has_move_buff(me):
@@ -642,18 +679,32 @@ class DecisionEngine:
             return None
         return actions.set_guard(node, extra_good_fruit=1)
 
-    # ---- M8: 自适应窗口出牌 ----
+    # ---- M8: 自适应窗口出牌 + 窗口回避 ----
 
     def _window_card_adaptive(self, world, me):
-        """自适应窗口出牌：优先使用对手模型反制，回退到固定优先级。"""
+        """自适应窗口出牌 + 快速弃权判断。
+
+        如果窗口不值得争（资源价值低、我们领先不需要冒险），
+        直接弃权缩短窗口耗时，避免无谓的 3 帧消耗。
+        """
         contests = world.my_contests()
         if not contests:
+            self._window_rounds = 0
             return None
 
         c = contests[0]
         cid = c.get("contestId")
+        ctype = c.get("contestType")
         if not cid:
             return None
+
+        # 追踪窗口参与
+        self._window_rounds += 1
+
+        # ★ 快速弃权判断：不值得争的窗口直接放弃
+        if self._should_concede_window(world, me, c):
+            self._mark_window_cooldown(world, me)
+            return actions.window_card(cid, Card.ABSTAIN)
 
         # 尝试自适应反制
         result = self.opponent.adaptive_window_card(world, me, c)
@@ -661,8 +712,52 @@ class DecisionEngine:
             cid, card = result
             return actions.window_card(cid, card)
 
-        # 回退到固定优先级（原 _window_card 逻辑）
+        # 回退到固定优先级
         return self._window_card_fallback(world, me)
+
+    def _should_concede_window(self, world, me, contest):
+        """判断是否应该快速弃权。
+
+        弃权条件（任一满足）：
+        1. 我们在竞速/领先态，不值得为资源/任务耗 3+ 帧
+        2. 同一节点已经争过（连续窗口）
+        3. 争夺对象是情报/短程马等低价值资源
+        """
+        ctype = contest.get("contestType")
+
+        # PASS 窗口不能弃权（被迫参战，必须尽力）
+        if ctype == "PASS":
+            return False
+
+        # GATE 窗口不能弃权（宫门验核是关键）
+        if ctype == "GATE":
+            return False
+
+        # 已经在这个节点争了超过 1 轮 → 放弃
+        if self._window_rounds >= 3:
+            return True
+
+        # 领先/竞速态：资源不值得消耗 3+ 帧窗口时间
+        if self.opponent.posture in ("leading", "racing"):
+            if ctype == "RESOURCE":
+                return True  # 让给对手，我们继续赶路
+
+        # 落后态：TASK 窗口值得争（追分需要）
+        # RESOURCE/DOCK 让给对手
+        if self.opponent.posture == "trailing":
+            if ctype in ("RESOURCE", "DOCK"):
+                return True
+
+        return False
+
+    def _mark_window_cooldown(self, world, me):
+        """记录窗口冷却：从此节点退出后，短期内不再触发同类型窗口。"""
+        node = me.current_node_id
+        if node:
+            # 冷却 12 帧（覆盖 RESTING + 重试周期）
+            self._window_node_skip[node] = (world.round or 0) + 12
+            self._last_contested_node = node
+        self._window_rounds = 0
 
     def _window_card_fallback(self, world, me):
         """窗口出牌固定优先级（对手模型无数据时的回退策略）。"""
@@ -726,6 +821,9 @@ class DecisionEngine:
         if node != self._stay_node:
             self._stay_node = node
             self._processed_here = False
+            # 切换节点时清除窗口冷却（新节点新环境）
+            self._window_rounds = 0
+
         gm = self.ctx.game_map
         is_proc_node = gm is not None and node in gm.process_nodes
         transition_done = (is_proc_node and self._prev_state == PlayerState.PROCESSING
