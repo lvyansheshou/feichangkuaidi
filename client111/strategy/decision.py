@@ -240,8 +240,11 @@ class DecisionEngine:
                 if me.freshness < 95:
                     return actions.use_resource(ResourceType.ICE_BOX)
 
-        # 有多余冰鉴 → 不攒，直接用
-        if ice >= 2 and me.freshness < 95:
+        # v4.3: 有多余冰鉴 → 不攒，直接用
+        if ice >= 2 and me.freshness < 97:
+            return actions.use_resource(ResourceType.ICE_BOX)
+        # v4.3: 低于目标鲜度且还有冰鉴 → 立即用
+        if me.freshness < config.TARGET_FRESHNESS and ice >= 1:
             return actions.use_resource(ResourceType.ICE_BOX)
 
         return None
@@ -470,18 +473,19 @@ class DecisionEngine:
         # 路径3: 时间最优（仅障碍/守卫阻塞）
         path_safe, cost_safe = gm.time_optimal_path(src, dst, blocked=blocked)
 
-        # ── 动态鲜度权重 ──
+        # ── 动态鲜度权重（目标 85%）──
         remaining_budget = duration - current_round - config.DELIVER_TIME_MARGIN
-        # 鲜度越低 → 越需要保护 → 权重越大
-        freshness_urgency = max(0, (100 - me.freshness) / 30.0)
+        # 距目标鲜度越远 → 越急迫
+        freshness_gap = max(0, me.freshness - config.TARGET_FRESHNESS)
+        freshness_urgency = max(0.5, (100 - me.freshness) / 20.0)
         # 时间越充裕 → 权重越大
         if cost_base > 0 and remaining_budget > cost_base:
-            time_slack = (remaining_budget - cost_base) / max(1, cost_base)
+            time_slack = min(3.0, (remaining_budget - cost_base) / max(1, cost_base) * 2)
         else:
             time_slack = 0
         # 天气加剧鲜度损耗 → 权重加大
-        weather_bonus = 1.0 if active_wt in ("HOT", "MOUNTAIN_FOG") else 0
-        fw = min(4.0, max(0.3, freshness_urgency + time_slack * 2 + weather_bonus))
+        weather_bonus = 1.5 if active_wt in ("HOT", "MOUNTAIN_FOG") else 0
+        fw = min(5.0, max(1.0, freshness_urgency + time_slack + weather_bonus))
 
         # ── 路径4: 鲜度+时间平衡 ──
         path_fresh = None
