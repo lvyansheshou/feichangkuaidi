@@ -890,33 +890,25 @@ class DecisionEngine:
         return None
 
     def _plan_attack(self, me, ns):
-        """v4.5fix: 攻坚计算 — 不限制好果/坏果投入上限（任务书无硬上限）。
+        """攻坚计算（协议限制 goodFruit/badFruit 均为 0-2）。
 
-        好果×2 + 坏果×3 + 破关令(+3) ≥ 防守值 即可破卡。
-        优先用坏果（交付分低），其次好果。破关令免费加3。
+        好果×2 + 坏果×3 + 破关令(+3) ≥ 防守值。
+        优先用坏果（交付分低），其次好果。
         """
         defense = (ns.guard or {}).get("defense", 0) or 0
         if defense <= 0:
             return None
         bo = (me.rush_tactic_used_count or 0) == 0
         bonus = 3 if bo else 0
-        # v4.5fix: 不设上限，有多少用多少（但保留KEEP_GOOD_FRUIT_MIN）
-        avail_g = max(0, me.good_fruit - config.KEEP_GOOD_FRUIT_MIN)
-        avail_b = me.bad_fruit or 0
-        # 优先用坏果（不值钱），不够再用好果
+        max_g = min(2, max(0, me.good_fruit - config.KEEP_GOOD_FRUIT_MIN))
+        max_b = min(2, me.bad_fruit or 0)
         best = None
-        for b in range(min(avail_b, 5), -1, -1):  # 从多到少试坏果
-            remaining = defense - b * 3 - bonus
-            if remaining <= 0:
-                if best is None or b < best[1]:
-                    best = (0, b, bo)
-                continue
-            g_needed = (remaining + 1) // 2  # ceil(remaining/2)
-            if g_needed <= avail_g:
-                if best is None or (g_needed, b) < (best[0], best[1]):
-                    best = (g_needed, b, bo)
-        if best is None and bonus >= defense:
-            best = (0, 0, bo)  # 纯破关令即够
+        # 优先用坏果
+        for b in range(max_b, -1, -1):
+            for g in range(max_g, -1, -1):
+                if g * 2 + b * 3 + bonus >= defense:
+                    if best is None or (g + b) < (best[0] + best[1]):
+                        best = (g, b, bo)
         return best
 
     # ================================================================
