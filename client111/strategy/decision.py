@@ -1,12 +1,12 @@
-r"""决策引擎 v4 — 鲜度优先 + 得分最大化。
+r"""决策引擎 v4.1 — 时间预算 + 鲜度感知路由。
 
-v3→v4 改进（优先鲜度和得分，而非仅追求快速交付）:
-  1. 鲜度感知路由: 优先选择鲜度损耗低的路线（水路 > 官道 > 山路）
-  2. 激进冰鉴: 更高鲜度阈值使用冰鉴（88），保鲜度分
-  3. 降低绕路任务: 任务分有上限(180)，鲜度无上限 → 减少任务绕路
-  4. 提前护果令: RUSH 阶段鲜度 < 95 即用护果令
-  5. 多冰鉴策略: 保持至少 2 个冰鉴储备
-  6. 每帧鲜度 ≈ 1.8 分，任务绕路鲜度代价需纳入决策
+核心思路：平均对局 ~460 回合。在此预算内，优先选择
+鲜度损耗最低的路径，而非仅追求最快到达。
+
+v4→v4.1:
+  1. 时间预算感知: 估算剩余帧是否充裕，充裕时选鲜度更优路径
+  2. 鲜度路由阈值: 鲜度优先路径必须能在预算内到达终点
+  3. 每帧鲜度 ≈ 1.8 分，省鲜度即省分
 """
 
 import math
@@ -446,37 +446,59 @@ class DecisionEngine:
     # ================================================================
 
     def _advance(self, world, me, gm, src, dst, terminal):
-        """v4: 鲜度感知路由。核心逻辑：
-        1. 计算时间最优路径
-        2. 若存在鲜度更优路径（低鲜度损耗路线类型）且帧数差距可接受 → 选鲜度路径
-        3. 直路有障碍→绕行或清障
-        4. 天气有害→天气感知绕行
+        """v4.1: 时间预算 + 鲜度感知路由。
+
+        1. 计算时间最优路径帧数
+        2. 若剩余帧数充裕（超出最快路径 50+ 帧），寻找鲜度更优路径
+        3. 鲜度路径必须能在预算内到达，否则退回最快路径
+        4. 天气有害时优先绕行保护鲜度
         """
         blocked = self._blocked_nodes(world, me)
         active_wt = world.active_weather_type()
         upcoming = world.upcoming_weather(within_frames=30)
+        current_round = world.round or 0
+        duration = self.ctx.duration_round or 600
 
-        # 基础路径
+        # 时间最优路径（基准）
         path_b, cost_b = gm.time_optimal_path(src, dst, blocked=blocked)
         path_u, cost_u = gm.time_optimal_path(src, dst)
 
-        # v4-fix: 鲜度路由仅在天气有害时才启用（避免绕远路）
-        # 天气路由——天气损害直路时寻找替代路径
+        # ── v4.1: 时间预算感知鲜度路由 ──
+        # 剩余可用的总帧数 = 回合上限 - 当前回合 - 安全余量
+        remaining_budget = duration - current_round - config.DELIVER_TIME_MARGIN
+
+        # 只有在时间充裕（剩余帧 > 最快路径 + 50 帧裕量）时才考虑鲜度路由
+        if path_u and len(path_u) > 1 and remaining_budget > cost_u + 50:
+            freshness_path = self._freshness_optimal_path(gm, src, dst)
+            if freshness_path and len(freshness_path) > 1:
+                fresh_cost = self._estimate_path_frames(gm, freshness_path)
+                # 鲜度路径必须能在预算内到达终点
+                if fresh_cost <= remaining_budget:
+                    # 鲜度路径的额外帧数不能超过可接受的裕量
+                    extra = fresh_cost - cost_u
+                    if extra <= 60:  # 最多多花 60 帧换鲜度
+                        path_u = freshness_path
+                        cost_u = fresh_cost
+                        # 重新计算阻塞路径
+                        path_b2, cost_b2 = gm.time_optimal_path(
+                            src, dst, blocked=blocked)
+                        if cost_b2 - cost_u <= 60:
+                            path_b, cost_b = path_b2, cost_b2
+
+        # ── 天气路由 ──
         weather_hurts_direct = self._weather_hurts_path(active_wt, gm, path_u)
         if weather_hurts_direct:
             path_w, cost_w = gm.weather_adjusted_path(
                 src, dst, weather_type=active_wt, blocked=blocked)
             if path_w and len(path_w) > 1:
-                # v4: 天气绕行预算内 → 绕行（保护鲜度）
                 if cost_w - cost_u <= 40:
                     path_b, cost_b = path_w, cost_w
 
-        # v4: 酷暑/山雾预告→倾向官道（鲜度安全）
+        # 酷暑/山雾预告→倾向官道（鲜度安全）
         if upcoming and upcoming.get("type") in ("HOT", "MOUNTAIN_FOG"):
             u_types = self._path_route_types(gm, path_u)
             u_mtn = sum(1 for t in u_types if t == "MOUNTAIN") / max(1, len(u_types))
             if u_mtn > 0.3:
-                # 寻找山路比例更低的替代路径
                 alt_path, alt_cost = gm.weather_adjusted_path(
                     src, dst, weather_type=upcoming.get("type"), blocked=blocked)
                 if alt_path and len(alt_path) > 1 and alt_cost - cost_u < 40:
@@ -485,11 +507,12 @@ class DecisionEngine:
                     if a_mtn < u_mtn - 0.1:
                         path_b, cost_b = alt_path, alt_cost
 
+        # ── 执行移动 ──
         if path_b and len(path_b) > 1 and path_u and len(path_u) > 1:
             nxt_u = path_u[1]
             ns = world.node(nxt_u)
 
-            # v3: 障碍处理决策树（保留）
+            # 障碍处理
             if ns and ns.has_obstacle and not self._is_cooldown(world, nxt_u):
                 detour_extra = cost_b - cost_u
                 if detour_extra <= self._obstacle_detour_budget:

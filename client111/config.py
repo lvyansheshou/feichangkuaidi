@@ -57,5 +57,7 @@ ENABLE_OFFENSIVE = False         # 主动设卡开关（delivery-first，默认�
 FP_RETRY_LIMIT = 4               # FORCED_PASS 连续失败上限
 FP_RETRY_COOLDOWN = 30           # FORCED_PASS 冷却帧数
 
-# 鲜度感知路由：优先选择鲜度损耗低的路线，即使帧数稍多
-FRESHNESS_FIRST_MAX_EXTRA = 25   # 换低鲜度损耗路线最多额外帧数
+# 鲜度感知路由 v4.1：时间预算内优先选鲜度损耗最低的路线
+FRESHNESS_FIRST_MAX_EXTRA = 60       # 换鲜度更优路线最多额外帧数
+FRESHNESS_ROUTE_SLACK = 50           # 剩余帧 > 最快路径 + 此值时才启用鲜度路由
+TARGET_DELIVER_ROUND = 460           # 目标交付回合（平均对局长度）
