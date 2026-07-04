@@ -344,7 +344,7 @@ class DecisionEngine:
         ns = world.node(node)
         if ns is None:
             return None
-        MAX_CLAIM_FAILURES = 3
+        MAX_CLAIM_FAILURES = 5  # v4.5fix: 冰鉴等关键资源多给机会
         # 冰鉴优先 — 当前节点（豁免时间预算）
         ice_key = (node, 'ICE_BOX')
         if (me.resource_count(ResourceType.ICE_BOX) < config.CLAIM_ICE_BOX_KEEP
