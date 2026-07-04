@@ -462,27 +462,25 @@ class DecisionEngine:
         path_b, cost_b = gm.time_optimal_path(src, dst, blocked=blocked)
         path_u, cost_u = gm.time_optimal_path(src, dst)
 
-        # ── v4.1: 时间预算感知鲜度路由 ──
+        # ── v4.2: 时间预算 + 动态鲜度路由 ──
         # 剩余可用的总帧数 = 回合上限 - 当前回合 - 安全余量
         remaining_budget = duration - current_round - config.DELIVER_TIME_MARGIN
 
-        # 只有在时间充裕（剩余帧 > 最快路径 + 50 帧裕量）时才考虑鲜度路由
+        # 时间充裕时使用鲜度+时间平衡路由（GameMap 原生支持）
         if path_u and len(path_u) > 1 and remaining_budget > cost_u + 50:
-            freshness_path = self._freshness_optimal_path(gm, src, dst)
-            if freshness_path and len(freshness_path) > 1:
-                fresh_cost = self._estimate_path_frames(gm, freshness_path)
-                # 鲜度路径必须能在预算内到达终点
-                if fresh_cost <= remaining_budget:
-                    # 鲜度路径的额外帧数不能超过可接受的裕量
-                    extra = fresh_cost - cost_u
-                    if extra <= 60:  # 最多多花 60 帧换鲜度
-                        path_u = freshness_path
-                        cost_u = fresh_cost
-                        # 重新计算阻塞路径
-                        path_b2, cost_b2 = gm.time_optimal_path(
-                            src, dst, blocked=blocked)
-                        if cost_b2 - cost_u <= 60:
-                            path_b, cost_b = path_b2, cost_b2
+            # freshness_weight 控制鲜度偏好强度（越高越倾向低损耗路线）
+            # 时间越充裕 → 权重越大 → 更倾向鲜度路线
+            slack = remaining_budget - cost_u
+            fw = min(3.0, max(0.5, slack / 100.0))
+            fresh_path, _ = gm.freshness_optimal_path(
+                src, dst, blocked=blocked, freshness_weight=fw)
+            if fresh_path and len(fresh_path) > 1:
+                _, fresh_cost = gm.time_optimal_path(
+                    src, dst, blocked=blocked)
+                if fresh_cost <= remaining_budget and fresh_cost - cost_u <= 60:
+                    path_b = fresh_path
+                    cost_b = fresh_cost
+                    path_u, cost_u = gm.time_optimal_path(src, dst)
 
         # ── 天气路由 ──
         weather_hurts_direct = self._weather_hurts_path(active_wt, gm, path_u)
