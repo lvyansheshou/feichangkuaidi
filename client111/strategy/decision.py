@@ -84,10 +84,15 @@ class DecisionEngine:
             if me.delivered or me.state == PlayerState.DELIVERED:
                 return result
 
+            # v4.5fix: 未处理的站点优先处理，跳过非关键窗口博弈
+            need_process = (node in gm.process_nodes and not self._processed_here)
             card = self._window_card(world, me)
-            if card:
-                result = [card]
-                return result
+            if card and card.get("card") != Card.ABSTAIN:
+                # 仅在非处理站点或高筹码博弈时才出牌
+                if not need_process or self._stakes_high(card, world):
+                    result = [card]
+                    return result
+                # 处理站点 + 低筹码博弈 → 弃权，优先处理
 
             if me.state in (PlayerState.MOVING, PlayerState.WAITING):
                 horse = self._maybe_horse(me, gm, terminal)
@@ -928,6 +933,16 @@ class DecisionEngine:
 
         self._window_played.setdefault(cid, set()).add(ri)
         return actions.window_card(cid, card)
+
+    def _stakes_high(self, card, world):
+        """v4.5fix: 判断当前窗口是否高筹码（GATE/PASS级别）。
+        低筹码窗口（TASK/OBSTACLE/DOCK/RESOURCE）在需要处理站点时跳过。
+        """
+        contests = world.my_contests()
+        if not contests:
+            return False
+        c = contests[0]
+        return self._stakes(c) >= 3
 
     def _my_active_contests(self, world):
         contests = world.my_contests()
