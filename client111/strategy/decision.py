@@ -342,12 +342,11 @@ class DecisionEngine:
         ns = world.node(node)
         if ns is None:
             return None
-        MAX_CLAIM_FAILURES = 5  # v4.5fix: 冰鉴等关键资源多给机会
-        # 冰鉴优先 — 当前节点（豁免时间预算）
+        MAX_CLAIM_FAILURES = 5
+        # 冰鉴优先 — 不限制重试（demo 也无限重试，冰鉴太重要）
         ice_key = (node, 'ICE_BOX')
         if (me.resource_count(ResourceType.ICE_BOX) < config.CLAIM_ICE_BOX_KEEP
                 and ns.resource_available(ResourceType.ICE_BOX)
-                and self._claim_fail_count.get(ice_key, 0) < MAX_CLAIM_FAILURES
                 and ice_key not in self._claim_attempted):
             self._claim_attempted.add(ice_key)
             return actions.claim_resource(node, ResourceType.ICE_BOX)
