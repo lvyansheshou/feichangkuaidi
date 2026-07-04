@@ -992,7 +992,12 @@ class DecisionEngine:
         return sorted(contests, key=self._stakes, reverse=True)
 
     def _stakes(self, c):
-        return self._STAKES_RANK.get(c.get("contestType"), 1)
+        base = self._STAKES_RANK.get(c.get("contestType"), 1)
+        # v4.5fix: 冰鉴资源博弈 → 最高筹码（≈18分，必须赢）
+        subject = c.get("subject") or ""
+        if "ICE_BOX" in subject.upper():
+            return 3  # GATE/PASS 级别
+        return base
 
     def _my_color(self, c):
         return "RED" if c.get("redPlayerId") == self.ctx.player_id else "BLUE"
