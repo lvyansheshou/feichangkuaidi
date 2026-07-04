@@ -525,57 +525,46 @@ class DecisionEngine:
         return base + r.milestone_bonus(base) >= 180
 
     def _pick_best_initial_route(self, world, me, gm, terminal):
-        """v4.5fix: S01 智能选路。对比山路和官道的预期总收益。
+        """v4.5fix: S01 智能选路。核心原则：冰鉴数量 > 鲜度损耗。
 
-        山路: S01→S06→S08→S10 (快，独占S06冰鉴，但鲜度损耗高)
-        官道: S01→S02→S03→S07→S09→S10 (慢，共享冰鉴，鲜度损耗低)
+        官道 S01→S02→S03→S07→S09→S10: 2个冰鉴(S03,S07) + 低损耗
+        山路 S01→S06→S08→S10: 1个冰鉴(S06独占) + 高损耗
 
-        决策因素: 冰鉴独占性 > 鲜度损耗 > 时间成本
+        2冰鉴=+20鲜度=36分 >> 路径损耗差(~3鲜度=5分)
+        结论：优先官道抢2冰鉴，除非确定山路能给更大优势
         """
         if not terminal:
             return None
-        # 找山路和官道的分歧点
         neighbors = gm.neighbors('S01')
         mountain_next = 'S06' if 'S06' in neighbors else None
         road_next = 'S02' if 'S02' in neighbors else None
-        if not mountain_next or not road_next:
-            return None
+        if not road_next:
+            return mountain_next
+        if not mountain_next:
+            return road_next
 
-        # 山路评估
-        mtn_path, mtn_cost = self._time_path(world, 'S01', terminal)  # already freshness-weighted
-        mtn_loss = self._path_freshness_loss(world, mtn_path) if mtn_path else 999
-        mtn_ice = 0
-        for nid in (mtn_path or []):
-            ns = world.node(nid)
-            if ns and ns.resource_available(ResourceType.ICE_BOX):
-                mtn_ice += 1
+        # 评估两条路线的冰鉴数
+        road_path, _ = gm.time_optimal_path('S01', terminal)
+        mtn_path, _ = gm.time_optimal_path('S01', terminal, blocked={road_next})
 
-        # 官道评估
-        # 临时走 S02 方向计算
-        road_path, road_cost = gm.time_optimal_path('S01', terminal)  # unweighted baseline
-        if road_path and 'S02' in road_path[:3]:
-            road_loss = self._path_freshness_loss(world, road_path)
-            road_ice = 0
-            opp = world.opponent
-            opp_path = None
-            if opp and opp.current_node_id:
-                opp_path, _ = self._time_path(world, opp.current_node_id, terminal)
+        road_ice = 0
+        if road_path:
             for nid in road_path:
                 ns = world.node(nid)
                 if ns and ns.resource_available(ResourceType.ICE_BOX):
-                    # 对手也经过 → 可能被抢
-                    if opp_path and nid in opp_path:
-                        road_ice += 0.3  # 30%概率抢到
-                    else:
-                        road_ice += 1
-        else:
-            road_loss, road_ice, road_cost = 999, 0, 999
+                    road_ice += 1
 
-        # 综合评分: 冰鉴(+10)×个数 − 鲜度损耗 − 时间惩罚
-        mtn_score = mtn_ice * 10 - mtn_loss
-        road_score = road_ice * 10 - road_loss
+        mtn_ice = 0
+        if mtn_path:
+            for nid in mtn_path:
+                ns = world.node(nid)
+                if ns and ns.resource_available(ResourceType.ICE_BOX):
+                    mtn_ice += 1
 
-        return mountain_next if mtn_score >= road_score else road_next
+        # 官道冰鉴更多 → 选官道；否则山路
+        if road_ice >= mtn_ice:
+            return road_next
+        return mountain_next
 
     def _late_route_target(self, world, me, gate, terminal):
         """v4.5: r360后未验核→直奔宫门（demo RUSH_PREPOSITION_ROUND）。"""
@@ -989,10 +978,11 @@ class DecisionEngine:
     _STAKES_RANK = {"GATE": 3, "PASS": 3, "TASK": 2, "OBSTACLE": 2, "DOCK": 1, "RESOURCE": 1}
 
     def _window_card(self, world, me):
-        """v4.5: 反应式 3 拍出牌（demo 对手策略）。
+        """v4.5fix: 博弈策略 — 仅高价值窗口全力争，其余弃权省帧。
 
-        读对手上一拍牌，按筹码分级、克制矩阵反制。
-        胜负已定则弃权省成本。同帧多窗口选最高筹码者。
+        每一帧博弈 = 对手领先一帧到达资源点。
+        只争: GATE/PASS (必须)、ICE_BOX资源 (18分)
+        其余: 弃权省时
         """
         contests = self._my_active_contests(world)
         if not contests:
@@ -1006,12 +996,16 @@ class DecisionEngine:
         if played and ri in played:
             return None
 
+        stakes = self._stakes(c)
+        # v4.5fix: 仅 stakes>=3 (GATE/PASS/ICE_BOX) 才出牌，其余立即弃权
+        if stakes < 3:
+            self._window_played.setdefault(cid, set()).add(ri)
+            return actions.window_card(cid, Card.ABSTAIN)
+
         my_color = self._my_color(c)
         my_pt, opp_pt = self._points(c, my_color)
-        stakes = self._stakes(c)
-        allow_bing = stakes >= 3 and (me.guard_action_point or 0) > 0
-        allow_xian = stakes >= 2 and me.freshness >= 80 \
-            and me.good_fruit >= config.KEEP_GOOD_FRUIT_MIN + 1
+        allow_bing = (me.guard_action_point or 0) > 0
+        allow_xian = me.freshness >= 80 and me.good_fruit >= config.KEEP_GOOD_FRUIT_MIN + 1
         avail = self._available_cards(me, allow_bing, allow_xian)
 
         if my_pt >= 2 or opp_pt >= 2:
@@ -1025,7 +1019,7 @@ class DecisionEngine:
                 elif card is None:
                     card = Card.ABSTAIN
             else:
-                card = self._lead_card(me, avail, stakes >= 3)
+                card = self._lead_card(me, avail, True)
 
         self._window_played.setdefault(cid, set()).add(ri)
         return actions.window_card(cid, card)
