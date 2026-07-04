@@ -17,7 +17,8 @@ from core import rules as r
 from protocol import actions
 from protocol.enums import Action, Card, PlayerState, ResourceType
 
-_IDLE_LIKE = (PlayerState.IDLE, PlayerState.COST_BANKRUPT, PlayerState.CONTESTING, PlayerState.WAITING, PlayerState.RESTING, None)
+_IDLE_LIKE = (PlayerState.IDLE, PlayerState.COST_BANKRUPT, PlayerState.CONTESTING, PlayerState.WAITING, None)
+# 注: RESTING 按协议 §4.2 只能 WAIT/空动作，不在此列表
 _MOVE_BUFF_TYPES = frozenset({ResourceType.FAST_HORSE, ResourceType.SHORT_HORSE, "RUSH_SPEED"})
 _MOVE_BLOCK_CODES = frozenset({
     "MOVE_BLOCKED_BY_GUARD", "TARGET_NOT_REACHABLE",
@@ -95,9 +96,8 @@ class DecisionEngine:
             if me.state in (PlayerState.MOVING, PlayerState.WAITING):
                 horse = self._maybe_horse(me, gm, terminal, world)
                 if horse:
-                    main = [horse]
-                    if me.next_node_id:
-                        main.append(actions.move(me.next_node_id))
+                    # v4.5fix: 马和MOVE同属主车队类别，每帧只能发1个
+                    main = [horse]  # 优先用马（加速），下帧再MOVE
                 elif me.state == PlayerState.MOVING:
                     if me.next_node_id:
                         main = [actions.move(me.next_node_id)]
