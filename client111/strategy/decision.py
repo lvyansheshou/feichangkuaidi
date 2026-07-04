@@ -54,7 +54,8 @@ class DecisionEngine:
         self._fp_failures = {}
         self._task_base = 0
         self._completed_task_ids = set()
-        # v3: 障碍绕行预算
+        self._task_attempted = set()    # v4.3: 已尝试过的任务（防重试风暴）
+        self._task_fail_count = {}      # v4.3: 任务失败计数
         self._obstacle_detour_budget = 25  # v4.2: 绕行≤25帧就绕，省好果优先
 
     # ================================================================
@@ -293,12 +294,21 @@ class DecisionEngine:
         return None
 
     def _maybe_task(self, world, me, gm, node, terminal):
+        """v4.3: 任务领取 + 防重试风暴。失败≥3次的任务不再尝试。"""
         pid = self.ctx.player_id
+        MAX_TASK_FAILURES = 3
         for t in world.active_tasks():
             if t.get("nodeId") != node:
                 continue
             tid = t.get("taskTemplateId")
             if tid in config.SKIP_TASK_TEMPLATES:
+                continue
+            task_id = t.get("taskId")
+            # 防重试：已失败≥3次的任务跳过
+            if self._task_fail_count.get(task_id, 0) >= MAX_TASK_FAILURES:
+                continue
+            # 已尝试过但不确定结果的任务，标记为尝试中
+            if task_id in self._task_attempted:
                 continue
             prot = t.get("protectionPlayerId") or 0
             if prot and prot != pid:
@@ -309,18 +319,24 @@ class DecisionEngine:
             pr = t.get("processRound", 0) or 0
             if not self._can_afford(world, gm, node, pr, terminal):
                 continue
-            return actions.claim_task(t.get("taskId"))
+            self._task_attempted.add(task_id)
+            return actions.claim_task(task_id)
         return None
 
     def _maybe_claim_v2(self, world, me, gm, node, terminal):
+        """v4.3: 资源领取 + 前方冰鉴探测。"""
         ns = world.node(node)
         if ns is None:
             return None
-        # 冰鉴优先
+        # 冰鉴优先 — 当前节点
         if (me.resource_count(ResourceType.ICE_BOX) < config.CLAIM_ICE_BOX_KEEP
                 and ns.resource_available(ResourceType.ICE_BOX)):
             if self._can_afford(world, gm, node, 2, terminal):
                 return actions.claim_resource(node, ResourceType.ICE_BOX)
+        # 冰鉴 — 前方路径节点探测
+        ice_detour = self._find_ice_on_route(world, me, gm, node, terminal)
+        if ice_detour:
+            return ice_detour
         # 马——剩余距离>100
         if not self._has_any_horse(me) and terminal and node:
             dist = gm.route_distance(node, terminal)
@@ -337,6 +353,33 @@ class DecisionEngine:
                 and self._intel_usable_ahead(world, me, gm, node, terminal)):
             if self._can_afford(world, gm, node, 2, terminal):
                 return actions.claim_resource(node, ResourceType.INTEL)
+        return None
+
+    def _find_ice_on_route(self, world, me, gm, node, terminal):
+        """v4.3: 在前方路径上找冰鉴资源。冰鉴不足时主动探测。
+
+        沿时间最优路径向前看 3 跳，如果有节点提供冰鉴且距路径不远，
+        返回 CLAIM_RESOURCE 动作（稍微绕路去领）。
+        """
+        if me.resource_count(ResourceType.ICE_BOX) >= config.CLAIM_ICE_BOX_KEEP:
+            return None
+        if not terminal:
+            return None
+        path, _ = gm.time_optimal_path(node, terminal)
+        if not path or len(path) < 2:
+            return None
+        # 沿路径向前看
+        for i in range(1, min(4, len(path))):
+            nid = path[i]
+            ns = world.node(nid)
+            if ns and ns.resource_available(ResourceType.ICE_BOX):
+                # 该节点在路径上且可领冰鉴
+                if nid == path[1]:
+                    # 下一跳就是 → 到达时自然会领
+                    return None
+                # 需要稍微绕路 → 领了再回来
+                if self._can_afford(world, gm, node, 3, terminal):
+                    return actions.claim_resource(nid, ResourceType.ICE_BOX)
         return None
 
     # ================================================================
@@ -887,6 +930,8 @@ class DecisionEngine:
         if la is None:
             return
         self._detect_fp_result(world, la)
+        # v4.3: 跟踪任务完成事件
+        self._detect_task_complete(world)
         code = self._my_reject_code(world)
         if not code:
             return
@@ -897,6 +942,24 @@ class DecisionEngine:
             tgt = la.get("targetNodeId")
             if tgt:
                 self._cooldown[tgt] = (world.round or 0) + config.REJECT_BLOCK_ROUNDS
+        # v4.3: 任务领取被拒 → 记录失败，避免死循环重试
+        if la.get("action") == "CLAIM_TASK":
+            tid = la.get("taskId")
+            if tid:
+                self._task_fail_count[tid] = self._task_fail_count.get(tid, 0) + 1
+                self._task_attempted.discard(tid)
+
+    def _detect_task_complete(self, world):
+        """v4.3: 检测任务完成 → 清除任务跟踪状态。"""
+        pid = self.ctx.player_id
+        for e in (world.events or []):
+            if e.get("type") == "TASK_COMPLETE":
+                payload = e.get("payload") or {}
+                if payload.get("playerId") == pid:
+                    tid = payload.get("taskId")
+                    if tid:
+                        self._task_attempted.discard(tid)
+                        self._task_fail_count.pop(tid, None)
 
     def _detect_fp_result(self, world, last_action):
         if last_action.get("action") != Action.FORCED_PASS:
