@@ -527,10 +527,11 @@ class DecisionEngine:
         return terminal
 
     def _ice_box_detour_target(self, world, me, gm, node, terminal):
-        """v4.5: 绕路领冰鉴（demo _ice_box_detour_target）。
+        """v4.5fix: 绕路领冰鉴 — 含独占节点优先。
 
-        净收益过滤: 冰鉴+10 − 绕路额外损耗 ≥ ICE_BOX_DETOUR_NET_MIN(6)。
-        排除山路等高损耗绕路，保留官道绕路。
+        核心洞察: 对手走官道 S01→S02→S03→S07，冰鉴被抢。
+        山路 S01→S06→S08 的 S06 冰鉴是独占的。即使山路损耗略高，
+        独占冰鉴 +10 的收益远超额外损耗。
         """
         if not terminal:
             return None
@@ -547,6 +548,9 @@ class DecisionEngine:
         if direct_cost == _INF or not direct_path:
             return None
         direct_loss = self._path_freshness_loss(world, direct_path)
+        # 对手位置（判断冰鉴是否会被抢）
+        opp = world.opponent
+        opp_node = opp.current_node_id if opp else None
         best, best_extra = None, _INF
         for nid, ns in world.node_states.items():
             if nid == node or not ns.resource_available(ResourceType.ICE_BOX):
@@ -560,7 +564,11 @@ class DecisionEngine:
                 continue
             via_loss = self._path_freshness_loss(world, p1[:-1] + p2)
             net = 10 - (via_loss - direct_loss)
-            if net < config.ICE_BOX_DETOUR_NET_MIN:
+            # v4.5fix: 独占节点(对手不经过)降低净收益门槛
+            is_exclusive = opp_node and nid not in (
+                self._time_path(world, opp_node, terminal)[0] or [])
+            min_net = 2.0 if is_exclusive else config.ICE_BOX_DETOUR_NET_MIN
+            if net < min_net:
                 continue
             if extra < best_extra and self._can_afford(
                     world, gm, node, extra, terminal,
