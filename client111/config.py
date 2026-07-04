@@ -3,9 +3,7 @@
 禁止写死 playerId / host / port / 阵营（由启动参数与 start 动态决定）。
 所有时间单位为秒（除非显式标注帧）。
 
-v4.4: 基于对手分析 — 慢就是快，保鲜就是得分。
-对方 r561 到达、鲜度 88.57。我方 r469 到达、鲜度 74.68。
-结论：多花 92 帧绕行官道/水路，换 14 点鲜度 = 净赚 25 分。
+v4.5: 移植 demo 对手优势 — 冰鉴≤90、鲜度λ路由、预算豁免、任务追180。
 """
 
 # ---- 客户端标识 ----
@@ -13,58 +11,72 @@ CLIENT_VERSION = "1.0"
 DEFAULT_PLAYER_NAME = "litchi-agent"
 
 # ---- 帧格式（协议 §1）----
-LENGTH_PREFIX_WIDTH = 5          # 5 位十进制长度前缀
-MAX_FRAME_BODY_BYTES = 99999     # body 的 UTF-8 字节数上限
+LENGTH_PREFIX_WIDTH = 5
+MAX_FRAME_BODY_BYTES = 99999
 
 # ---- socket ----
-RECV_CHUNK = 65536               # 单次 recv 读取字节数
-CONNECT_TIMEOUT = 10.0           # 建连超时
+RECV_CHUNK = 65536
+CONNECT_TIMEOUT = 10.0
 
 # ---- 时序超时 ----
-HANDSHAKE_TIMEOUT = 30.0         # 等待 start 的最长时间
-RECV_LOOP_TIMEOUT = 1.0          # 主循环从收包队列取消息的等待间隔
-DECISION_BUDGET = 0.4            # 单帧决策软预算（超 400ms 记告警）
+HANDSHAKE_TIMEOUT = 30.0
+RECV_LOOP_TIMEOUT = 1.0
+DECISION_BUDGET = 0.4
 
 # ---- 日志 ----
-LOG_DIR = "logs"                 # 相对启动工作目录
+LOG_DIR = "logs"
 
-# ---- 策略参数 v4.4: 基于对手分析 ----
-# 鲜度阈值（好果转坏）：首次低于这些值触发转坏
-FRESHNESS_THRESHOLDS = (90, 80, 70, 60, 50, 40, 30, 20, 10)
+# ================================================================
+#  策略参数 v4.5: 移植 demo 对手优势
+# ================================================================
 
-# 冰鉴 — 对方用了 2+ 次冰鉴保 88 鲜度。我方必须同样激进
-ICE_BOX_USE_BELOW = 96.0         # 鲜度 < 96 立即用冰鉴
-CLAIM_ICE_BOX_KEEP = 5           # 期望至少持有 5 个（疯狂囤积）
-ICE_BOX_DETOUR_RANGE = 5         # 沿路径向前探测冰鉴的跳数
+# -- 冰鉴（demo 核心优势）--
+# demo 洞察: ≤90 用不撞 100 上限; 线性损耗下冰鉴+10为永久偏移; 2个叠20可把80阈值延后到交付后
+ICE_BOX_CAP_AVOID = 90.0           # 鲜度≤此值即用（不撞100上限，全效存活到交付）
+ICE_BOX_LEAD = 7.0                 # （保留兼容）
+ICE_BOX_HOT_USE_BELOW = 88.0       # （保留兼容）
+CLAIM_ICE_BOX_KEEP = 3             # 期望至少持有的冰鉴数
+ICE_BOX_DETOUR_KEEP = 2            # 绕路收集冰鉴的目标持有量（达到即停）
+ICE_BOX_DETOUR_PROJECTED_BELOW = 85.0  # 投影交付鲜度低于此才绕路领冰鉴
+ICE_BOX_DETOUR_MAX_EXTRA_FRAMES = 60   # 绕路领冰鉴最大额外帧
+ICE_BOX_DETOUR_NET_MIN = 6.0       # 绕路领冰鉴净鲜度收益下限（+10 - 绕路损耗 ≥ 此值）
 
-# 马 — 尽早使用
-HORSE_MIN_REMAINING_DISTANCE = 15
+# -- 马 --
+HORSE_MIN_REMAINING_DISTANCE = 30
 
-# 急策 — RUSH 立即护果
-RUSH_PROTECT_BELOW = 99.0
+# -- 急策 --
+RUSH_PROTECT_FRESHNESS_BELOW = 90.0  # RUSH阶段鲜度低于此用护果令
 
-# 安全余量 — 对方 r561 仍交付，600 帧上限下允许更从容
-DELIVER_TIME_MARGIN = 5          # 交付时间安全余量（帧）
+# -- 安全余量 --
+DELIVER_TIME_SAFETY_MARGIN = 25   # 交付时间安全余量(帧)
+TASK_DETOUR_SAFETY_MARGIN = 15    # 任务绕路专用更紧余量
 
-# 任务 — 对方任务分 165、鲜度 88。我方任务 180、鲜度 74。
-# 教训：任务绕路换来的 15 分，被鲜度损失 25 分反超。不再绕路做任务。
+# -- 任务（demo: 追180封顶）--
+TASK_SEEK_TARGET = 180            # 任务分达此值即不再绕路
 SKIP_TASK_TEMPLATES = ("T04", "T06")
-TASK_DETOUR_MAX_EXTRA = 0        # 不绕路做任务（对方教训）
+TASK_DETOUR_MAX_EXTRA_FRAMES = 70  # 绕路做任务最大额外帧
+RESOURCE_CLAIM_ROUND = 2           # 资源领取读条帧数
 
-# 对抗 — 好果即分数，不清障
-KEEP_GOOD_FRUIT_MIN = 98         # 永远不清障（对方好果 99，我方 97）
+# -- 对抗 --
+KEEP_GOOD_FRUIT_MIN = 1            # 攻坚/清障后最低好果
 GATE_SCOUT_MIN_FRAMES = 8
 GATE_SCOUT_MAX_FRAMES = 40
 INTEL_RANGE = 15
-REROUTE_VS_CLEAR_EXTRA = 100     # 永远绕行不清障
+REROUTE_VS_CLEAR_EXTRA = 20        # 绕行>此帧数改清障
 SQUAD_AHEAD_MIN_HOPS = 2
 REJECT_BLOCK_ROUNDS = 4
-ENABLE_OFFENSIVE = False
-FP_RETRY_LIMIT = 1               # 立即强制通行
-FP_RETRY_COOLDOWN = 10           # 缩短冷却
+ENABLE_OFFENSIVE = False           # 进攻设卡(暂关，后续迭代)
+FP_RETRY_LIMIT = 4
+FP_RETRY_COOLDOWN = 30
 
-# 鲜度感知路由 v4.4 — 对方走官道/水路绕行拿下 88 鲜度
-FRESHNESS_FIRST_MAX_EXTRA = 120      # 允许大幅绕行换鲜度
-FRESHNESS_ROUTE_SLACK = 10           # 几乎总是启用鲜度路由
-TARGET_DELIVER_ROUND = 560           # 目标交付回合（对齐对方 r561）
-TARGET_FRESHNESS = 88.0              # 目标到达鲜度（对齐对方 88.57）
+# -- 鲜度路由（demo: λ=5.0 差分式）--
+FRESHNESS_ROUTE_LAMBDA = 5.0       # 路由鲜度权重λ: 边权+=λ×帧数×(路线损耗-WATER损耗)
+FRESHNESS_DETOUR_FLOOR = 65.0      # 绕路做任务的鲜度地板
+FRESHNESS_LOSS_ASSUME = 0.06       # 鲜度预算估算用每帧损耗(保守)
+
+# -- 后期前置宫门 --
+RUSH_PREPOSITION_ROUND = 360       # 此帧后未验核→直奔宫门
+
+# -- 目标 --
+TARGET_DELIVER_ROUND = 560
+TARGET_FRESHNESS = 88.0

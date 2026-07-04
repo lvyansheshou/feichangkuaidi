@@ -1,14 +1,13 @@
-r"""决策引擎 v4.2 — 鲜度 + 好果最高优先。
+r"""决策引擎 v4.5 — 移植 demo 对手优势。
 
-1 鲜度 ≈ 1.8 分，1 好果 ≈ 1.8 分。两者是得分核心，
-优先级高于快速交付、任务绕路、窗口博弈。
-
-v4.1→v4.2:
-  1. 冰鉴阈值 94: 鲜度刚跌就用冰鉴，几乎不等待
-  2. 好果保护 3: 清障/攻坚至少保留 3 好果，宁愿绕行
-  3. RUSH 立即护果: 鲜度 < 98 即用护果令
-  4. 任务绕路降到 20 帧: 鲜度损失 > 任务收益
-  5. 障碍优先绕行: 省好果，宁多花几帧
+核心改进（来自 demo 真机归因）:
+  1. 冰鉴≤90使用: 不撞100上限，+10全效存活到交付
+  2. 绕路领冰鉴: 净收益≥6才绕，排除山路高损耗绕路
+  3. 冰鉴领取免预算: 2帧成本<<1篓好果3.6分
+  4. 鲜度λ路由: time_optimal_path内置λ=5.0惩罚（差分式）
+  5. 任务追180: 封顶检测+慷慨绕路70帧
+  6. 后期前置宫门: r360未验核→直奔S14
+  7. 交付投影估算: _deliver_estimate用于预算决策
 """
 
 import math
@@ -111,8 +110,8 @@ class DecisionEngine:
     # ================================================================
 
     def _plan(self, world, me, gm, node, terminal, gate):
-        # 精确冰鉴
-        rescue = self._freshness_rescue_v2(me, world)
+        # v4.5: 冰鉴 ≤90 使用
+        rescue = self._freshness_rescue(world, me)
         if rescue:
             return [rescue]
 
@@ -165,7 +164,15 @@ class DecisionEngine:
         if opp:
             return opp
 
-        dst = self._task_detour_target(world, me, gm, node, terminal) or terminal
+        # v4.5: 后期前置宫门（demo RUSH_PREPOSITION_ROUND）
+        route_dst = self._late_route_target(world, me, gate, terminal)
+        if route_dst == gate:
+            return self._advance(world, me, gm, node, gate, terminal)
+
+        # v4.5: 绕路领冰鉴（鲜度优先）→ 绕路做任务
+        dst = (self._ice_box_detour_target(world, me, gm, node, terminal)
+               or self._task_detour_target(world, me, gm, node, terminal)
+               or terminal)
         if dst:
             return self._advance(world, me, gm, node, dst, terminal)
         return []
@@ -207,47 +214,17 @@ class DecisionEngine:
     #  L2 收益: 冰鉴/马/急策/任务/资源
     # ================================================================
 
-    def _freshness_rescue_v2(self, me, world=None):
-        """v4.2: 冰鉴最高优先。鲜度 < 94 即用，几乎不等待。
+    def _freshness_rescue(self, world, me):
+        """v4.5: 冰鉴 ≤90 使用（demo ICE_BOX_CAP_AVOID）。
 
-        冰鉴 +10 鲜度 ≈ 18 分。早用 = 早保住鲜度分。
+        demo 洞察: ≤90 用不撞 100 上限，+10 全效存活到交付。
+        线性损耗下冰鉴为永久偏移，2-3个叠20-30可把80阈值延后到交付后。
         """
-        ice = me.resource_count(ResourceType.ICE_BOX)
-        if ice <= 0 or me.freshness <= 0:
+        if me.resource_count(ResourceType.ICE_BOX) <= 0:
             return None
-
-        # 直接阈值触发（94，比 v4 的 88 再高 6 点）
-        if me.freshness < config.ICE_BOX_USE_BELOW:
+        f = me.freshness
+        if 0 < f <= config.ICE_BOX_CAP_AVOID:
             return actions.use_resource(ResourceType.ICE_BOX)
-
-        # 预判转坏：距下一阈值 ≤ 8 帧时提前用
-        est_loss = 0.065
-        wt = world.active_weather_type() if world else None
-        if wt == "HOT":
-            est_loss = 0.065 * 1.5
-        elif wt == "MOUNTAIN_FOG":
-            est_loss = 0.07
-        for threshold in (95, 90, 85, 80, 75, 70, 60, 50, 40):
-            if me.freshness < threshold:
-                continue
-            frames_to = (me.freshness - threshold) / max(est_loss, 0.001)
-            if 1 <= frames_to <= 8:
-                return actions.use_resource(ResourceType.ICE_BOX)
-
-        # 酷暑预告 → 立即冰鉴
-        if world is not None:
-            upcoming = world.upcoming_weather(within_frames=25)
-            if upcoming and upcoming.get("type") == "HOT":
-                if me.freshness < 95:
-                    return actions.use_resource(ResourceType.ICE_BOX)
-
-        # v4.3: 有多余冰鉴 → 不攒，直接用
-        if ice >= 2 and me.freshness < 97:
-            return actions.use_resource(ResourceType.ICE_BOX)
-        # v4.3: 低于目标鲜度且还有冰鉴 → 立即用
-        if me.freshness < config.TARGET_FRESHNESS and ice >= 1:
-            return actions.use_resource(ResourceType.ICE_BOX)
-
         return None
 
     def _maybe_horse(self, me, gm, terminal):
@@ -294,7 +271,9 @@ class DecisionEngine:
         return None
 
     def _maybe_task(self, world, me, gm, node, terminal):
-        """v4.3: 任务领取 + 防重试风暴。失败≥3次的任务不再尝试。"""
+        """v4.5: 任务领取 + 封顶检测（demo _task_score_capped）。"""
+        if self._task_score_capped(me):
+            return None
         pid = self.ctx.player_id
         MAX_TASK_FAILURES = 3
         for t in world.active_tasks():
@@ -304,10 +283,8 @@ class DecisionEngine:
             if tid in config.SKIP_TASK_TEMPLATES:
                 continue
             task_id = t.get("taskId")
-            # 防重试：已失败≥3次的任务跳过
             if self._task_fail_count.get(task_id, 0) >= MAX_TASK_FAILURES:
                 continue
-            # 已尝试过但不确定结果的任务，标记为尝试中
             if task_id in self._task_attempted:
                 continue
             prot = t.get("protectionPlayerId") or 0
@@ -328,15 +305,10 @@ class DecisionEngine:
         ns = world.node(node)
         if ns is None:
             return None
-        # 冰鉴优先 — 当前节点
+        # 冰鉴优先 — 当前节点（v4.5: 豁免时间预算，demo做法）
         if (me.resource_count(ResourceType.ICE_BOX) < config.CLAIM_ICE_BOX_KEEP
                 and ns.resource_available(ResourceType.ICE_BOX)):
-            if self._can_afford(world, gm, node, 2, terminal):
-                return actions.claim_resource(node, ResourceType.ICE_BOX)
-        # 冰鉴 — 前方路径节点探测
-        ice_detour = self._find_ice_on_route(world, me, gm, node, terminal)
-        if ice_detour:
-            return ice_detour
+            return actions.claim_resource(node, ResourceType.ICE_BOX)
         # 马——剩余距离>100
         if not self._has_any_horse(me) and terminal and node:
             dist = gm.route_distance(node, terminal)
@@ -422,28 +394,18 @@ class DecisionEngine:
         return False
 
     def _task_detour_target(self, world, me, gm, node, terminal):
-        """v4: 大幅降低任务绕路热情。逻辑：
-        - 任务分 > 90 → 不再绕路（上限 180，剩余收益递减）
-        - 绕路额外帧需 < 配置阈值
-        - 鲜度代价需可接受（绕路帧 × 鲜度损耗系数 < 预期任务分增益）
-        """
+        """v4.5: 任务绕路 — 封顶检测 + 鲜度地板 + 慷慨预算70帧（demo参数）。"""
         self._track_task_completion(world)
+        if self._task_score_capped(me) or not terminal:
+            return None
         base = self._task_base or me.task_score or 0
-        # v4: 任务分 ≥ 80 即停止绕路（v3 是 90）
-        if base >= 80 or not terminal:
+        if base >= config.TASK_SEEK_TARGET:
             return None
         pid = self.ctx.player_id
-        _, direct = gm.time_optimal_path(node, terminal)
+        _, direct = self._time_path(world, node, terminal)
         if direct == _INF:
             return None
-        budget = config.TASK_DETOUR_MAX_EXTRA
-        # v4: 鲜度代价估算：每帧 ≈ 0.06 鲜度 × 1.8 分/鲜度 ≈ 0.11 分/帧
-        # 30分任务需要 ≤ 270 帧额外才值得，但我们更保守
-        freshness_budget = (me.freshness - 70) / 0.06  # 最多损失到 70 鲜度
-        effective_budget = min(budget, int(freshness_budget * 0.5))
-        if effective_budget <= 0:
-            return None
-
+        budget = config.TASK_DETOUR_MAX_EXTRA_FRAMES
         best, best_extra = None, _INF
         for t in world.active_tasks():
             tn = t.get("nodeId")
@@ -458,14 +420,19 @@ class DecisionEngine:
             owner = t.get("ownerPlayerId") or 0
             if owner and owner != pid:
                 continue
-            _, c1 = gm.time_optimal_path(node, tn)
-            _, c2 = gm.time_optimal_path(tn, terminal)
+            _, c1 = self._time_path(world, node, tn)
+            _, c2 = self._time_path(world, tn, terminal)
             if c1 == _INF or c2 == _INF:
                 continue
             pr = t.get("processRound", 0) or 0
             extra = (c1 + pr + c2) - direct
-            if 0 <= extra <= effective_budget and extra < best_extra \
-                    and self._can_afford(world, gm, node, extra, terminal):
+            # 鲜度地板：预估鲜度不能跌破
+            projected = me.freshness - extra * config.FRESHNESS_LOSS_ASSUME
+            if projected < config.FRESHNESS_DETOUR_FLOOR:
+                continue
+            if 0 <= extra <= budget and extra < best_extra \
+                    and self._can_afford(world, gm, node, extra, terminal,
+                                         safety_margin=config.TASK_DETOUR_SAFETY_MARGIN):
                 best, best_extra = tn, extra
         return best
 
@@ -483,8 +450,101 @@ class DecisionEngine:
                         self._task_base += score
 
     # ================================================================
-    #  L3 v3: 智能天气路由 + 障碍绕行权衡 + 交付守卫
+    #  L3 v4.5: 鲜度λ路由 + 交付估算 + 冰鉴绕路
     # ================================================================
+
+    def _time_path(self, world, src, dst, blocked=None, enter_cost_fn=None):
+        """v4.5: time_optimal_path 的天气+鲜度λ封装（demo _time_path）。"""
+        return self.ctx.game_map.time_optimal_path(
+            src, dst, weather_type=world.active_weather_type(),
+            blocked=blocked, enter_cost_fn=enter_cost_fn,
+            freshness_weight=config.FRESHNESS_ROUTE_LAMBDA)
+
+    def _deliver_estimate(self, world, me, gm, node, terminal):
+        """v4.5: 从当前节点完成交付的估计帧数。"""
+        if not terminal:
+            return _INF
+        _, travel = self._time_path(world, node, terminal)
+        if travel == _INF:
+            return _INF
+        est = travel + 2
+        if not me.verified and gm.gate_node:
+            info = gm.process_nodes.get(gm.gate_node)
+            verify_frames = (info.get("processRound") if info else 6) or 6
+            est += verify_frames
+        return est
+
+    def _path_freshness_loss(self, world, path):
+        """v4.5: 估算路径总鲜度损耗。"""
+        if not path or len(path) < 2:
+            return 0.0
+        gm = self.ctx.game_map
+        wtype = world.active_weather_type()
+        wcoef = r.FRESHNESS_WEATHER_COEF.get(wtype, 1.0) if wtype else 1.0
+        total = 0.0
+        for i in range(len(path) - 1):
+            e = gm.edge_between(path[i], path[i + 1])
+            if e is None:
+                continue
+            wmult = r.weather_move_multiplier(e.route_type, wtype)
+            frames = r.frames_on_edge(e.distance, e.route_type, weather_mult=wmult)
+            total += frames * r.route_freshness_loss(e.route_type) * wcoef
+        return total
+
+    def _task_score_capped(self, me):
+        """v4.5: 任务分是否已达 180 封顶。"""
+        base = me.task_score or 0
+        return base + r.milestone_bonus(base) >= 180
+
+    def _late_route_target(self, world, me, gate, terminal):
+        """v4.5: r360后未验核→直奔宫门（demo RUSH_PREPOSITION_ROUND）。"""
+        if (gate and terminal and gate != terminal
+                and (world.round or 0) >= config.RUSH_PREPOSITION_ROUND
+                and not me.verified):
+            return gate
+        return terminal
+
+    def _ice_box_detour_target(self, world, me, gm, node, terminal):
+        """v4.5: 绕路领冰鉴（demo _ice_box_detour_target）。
+
+        净收益过滤: 冰鉴+10 − 绕路额外损耗 ≥ ICE_BOX_DETOUR_NET_MIN(6)。
+        排除山路等高损耗绕路，保留官道绕路。
+        """
+        if not terminal:
+            return None
+        have = me.resource_count(ResourceType.ICE_BOX)
+        if have >= config.ICE_BOX_DETOUR_KEEP:
+            return None
+        remaining = self._deliver_estimate(world, me, gm, node, terminal)
+        if remaining >= _INF:
+            return None
+        projected = me.freshness + have * 10 - remaining * config.FRESHNESS_LOSS_ASSUME
+        if projected >= config.ICE_BOX_DETOUR_PROJECTED_BELOW:
+            return None
+        direct_path, direct_cost = self._time_path(world, node, terminal)
+        if direct_cost == _INF or not direct_path:
+            return None
+        direct_loss = self._path_freshness_loss(world, direct_path)
+        best, best_extra = None, _INF
+        for nid, ns in world.node_states.items():
+            if nid == node or not ns.resource_available(ResourceType.ICE_BOX):
+                continue
+            p1, c1 = self._time_path(world, node, nid)
+            p2, c2 = self._time_path(world, nid, terminal)
+            if c1 == _INF or c2 == _INF or not p1 or not p2:
+                continue
+            extra = c1 + config.RESOURCE_CLAIM_ROUND + c2 - direct_cost
+            if extra <= 0 or extra > config.ICE_BOX_DETOUR_MAX_EXTRA_FRAMES:
+                continue
+            via_loss = self._path_freshness_loss(world, p1[:-1] + p2)
+            net = 10 - (via_loss - direct_loss)
+            if net < config.ICE_BOX_DETOUR_NET_MIN:
+                continue
+            if extra < best_extra and self._can_afford(
+                    world, gm, node, extra, terminal,
+                    safety_margin=config.DELIVER_TIME_SAFETY_MARGIN):
+                best, best_extra = nid, extra
+        return best
 
     def _advance(self, world, me, gm, src, dst, terminal):
         """v4.3: 动态路由 — 鲜度 + 对手位置 + 时间预算综合决策。
@@ -629,7 +689,7 @@ class DecisionEngine:
             return []
         return self._breakthrough(world, me, gm, path_u[1], terminal)
 
-    def _opponent_blocked_nodes(self, world, gm, src, terminal):
+    # === v4.5: 旧方法保留（不再使用，保留兼容） ===
         """v4.3: 对手感知阻塞。对手前方路径上的节点标记为需避开。"""
         blocked = set()
         opp = world.opponent
@@ -764,20 +824,34 @@ class DecisionEngine:
         return self._cooldown.get(nid, 0) > (world.round or 0)
 
     def _breakthrough(self, world, me, gm, nxt, terminal):
-        """v4.4: 永远不清障/不攻坚。好果即分数（对方好果 99）。"""
+        """v4.5: 突破障碍/敌卡。有好果→清障/攻坚，无好果→强制通行。"""
         ns = world.node(nxt)
         if ns and ns.has_obstacle:
-            # 有 T04 任务且不消耗好果 → 可以做
             t04 = self._find_t04(world, nxt)
             if t04:
                 self._fp_failures.pop(nxt, None)
                 return [actions.claim_task(t04.get("taskId"))]
-            # 直接强制通行（对方策略：不清障）
+            if me.good_fruit > config.KEEP_GOOD_FRUIT_MIN:
+                self._fp_failures.pop(nxt, None)
+                return [actions.clear_obstacle(nxt)]
             return [actions.forced_pass(nxt)]
 
         owner = ns.active_guard_owner() if ns else None
         if owner and owner != me.team_id:
-            # 直接强制通行（不清障策略的延续）
+            plan = self._plan_attack(me, ns)
+            if plan is not None:
+                self._fp_failures.pop(nxt, None)
+                g, b, bo = plan
+                return [actions.break_guard(nxt, good_fruit=g, bad_fruit=b,
+                                           rush_tactic=(Action.BREAK_ORDER if bo else None))]
+            fails = self._fp_failures.get(nxt, 0)
+            if fails >= config.FP_RETRY_LIMIT:
+                if fails >= config.FP_RETRY_LIMIT + config.FP_RETRY_COOLDOWN:
+                    self._fp_failures.pop(nxt, None)
+                    return [actions.forced_pass(nxt)]
+                self._fp_failures[nxt] = fails + 1
+                return []
+            self._fp_failures[nxt] = fails + 1
             return [actions.forced_pass(nxt)]
 
         return [actions.move(nxt)]
@@ -989,13 +1063,14 @@ class DecisionEngine:
             return False
         return gm.route_distance(node, terminal) > config.HORSE_MIN_REMAINING_DISTANCE
 
-    def _can_afford(self, world, gm, node, extra_frames, terminal):
+    def _can_afford(self, world, gm, node, extra_frames, terminal, safety_margin=None):
         if terminal is None:
             return True
-        _, travel = gm.time_optimal_path(node, terminal)
+        margin = safety_margin if safety_margin is not None else config.DELIVER_TIME_SAFETY_MARGIN
+        _, travel = self._time_path(world, node, terminal)
         if travel == _INF:
             return False
-        end = (world.round or 0) + extra_frames + travel + config.DELIVER_TIME_MARGIN
+        end = (world.round or 0) + extra_frames + travel + margin
         return end <= (self.ctx.duration_round or 600)
 
     def _update_process_memory(self, world, me, node):

@@ -173,22 +173,39 @@ class GameMap:
         adj = self._adj_move if metric == "move" else self._adj_dist
         return pathfind.shortest_path(adj, source, target)
 
-    def time_optimal_path(self, source, target, blocked=None):
+    def time_optimal_path(self, source, target, blocked=None,
+                           weather_type=None, enter_cost_fn=None,
+                           freshness_weight=0.0):
         """按帧数的最短路 (path, frames)。
 
-        边权 = 单边到站帧数 + 目标节点固定处理耗时。
-        blocked: 不可进入的节点集合（障碍/敌方设卡）。
+        边权 = 单边到站帧数 + 目标节点固定处理耗时 + 鲜度惩罚。
+        blocked: 不可进入的节点集合。
+        weather_type: 当前天气（影响通行倍率）。
+        enter_cost_fn: node_id -> 额外进入帧数回调（如设卡时间税）。
+        freshness_weight: λ>0 时边权 += λ×帧数×(路线损耗−WATER损耗)，差分式偏好水路/官道。
         """
         blocked = blocked or frozenset()
+        fw = freshness_weight or 0.0
         adj = {}
         for e in self.edges:
-            base = rules.frames_on_edge(e.distance, e.route_type, rules.BASE_MOVE_NONE)
+            wmult = rules.weather_move_multiplier(e.route_type, weather_type) if weather_type else 1000
+            base = rules.frames_on_edge(e.distance, e.route_type,
+                                        rules.BASE_MOVE_NONE, wmult)
+            # 鲜度惩罚（差分式：以 WATER=0.045 为基准）
+            penalty = 0.0
+            if fw > 0:
+                loss = rules.route_freshness_loss(e.route_type)
+                diff = loss - rules.FRESHNESS_LOSS_MOVE_MIN  # WATER=0.045
+                if diff > 0:
+                    penalty = fw * base * diff
             if e.to_node not in blocked:
+                extra = enter_cost_fn(e.to_node) if enter_cost_fn else 0
                 adj.setdefault(e.from_node, []).append(
-                    (e.to_node, base + self._proc_cost(e.to_node)))
+                    (e.to_node, base + self._proc_cost(e.to_node) + extra + penalty))
             if e.bidirectional and e.from_node not in blocked:
+                extra = enter_cost_fn(e.from_node) if enter_cost_fn else 0
                 adj.setdefault(e.to_node, []).append(
-                    (e.from_node, base + self._proc_cost(e.from_node)))
+                    (e.from_node, base + self._proc_cost(e.from_node) + extra + penalty))
         return pathfind.shortest_path(adj, source, target)
 
     def _proc_cost(self, node_id):
