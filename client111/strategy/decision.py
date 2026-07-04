@@ -16,7 +16,7 @@ from core import rules as r
 from protocol import actions
 from protocol.enums import Action, Card, PlayerState, ResourceType
 
-_IDLE_LIKE = (PlayerState.IDLE, PlayerState.COST_BANKRUPT, None)
+_IDLE_LIKE = (PlayerState.IDLE, PlayerState.COST_BANKRUPT, PlayerState.CONTESTING, PlayerState.WAITING, None)
 _MOVE_BUFF_TYPES = frozenset({ResourceType.FAST_HORSE, ResourceType.SHORT_HORSE, "RUSH_SPEED"})
 _MOVE_BLOCK_CODES = frozenset({
     "MOVE_BLOCKED_BY_GUARD", "TARGET_NOT_REACHABLE",
@@ -87,11 +87,10 @@ class DecisionEngine:
                 if horse:
                     result = [horse]
                     return result
-                card = self._window_card(world, me)
-                if card:
-                    result = [card]
+                # MOVING: nothing to do but wait for arrival
+                if me.state == PlayerState.MOVING:
                     return result
-                return result
+                # WAITING: fall through to _plan() — don't stay idle
 
             if me.state not in _IDLE_LIKE:
                 return result
