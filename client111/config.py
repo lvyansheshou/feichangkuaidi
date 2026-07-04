@@ -2,6 +2,10 @@
 
 禁止写死 playerId / host / port / 阵营（由启动参数与 start 动态决定）。
 所有时间单位为秒（除非显式标注帧）。
+
+v4.4: 基于对手分析 — 慢就是快，保鲜就是得分。
+对方 r561 到达、鲜度 88.57。我方 r469 到达、鲜度 74.68。
+结论：多花 92 帧绕行官道/水路，换 14 点鲜度 = 净赚 25 分。
 """
 
 # ---- 客户端标识 ----
@@ -24,41 +28,43 @@ DECISION_BUDGET = 0.4            # 单帧决策软预算（超 400ms 记告警�
 # ---- 日志 ----
 LOG_DIR = "logs"                 # 相对启动工作目录
 
-# ---- 策略参数 ----
+# ---- 策略参数 v4.4: 基于对手分析 ----
 # 鲜度阈值（好果转坏）：首次低于这些值触发转坏
 FRESHNESS_THRESHOLDS = (90, 80, 70, 60, 50, 40, 30, 20, 10)
 
-# 冰鉴 — 目标鲜度 85%：冰鉴即拿即用，尽量保持 3+ 储备
-ICE_BOX_USE_BELOW = 96.0         # 鲜度 < 96 立即用冰鉴（目标 85% 到达）
-CLAIM_ICE_BOX_KEEP = 4           # 期望至少持有的冰鉴数
+# 冰鉴 — 对方用了 2+ 次冰鉴保 88 鲜度。我方必须同样激进
+ICE_BOX_USE_BELOW = 96.0         # 鲜度 < 96 立即用冰鉴
+CLAIM_ICE_BOX_KEEP = 5           # 期望至少持有 5 个（疯狂囤积）
+ICE_BOX_DETOUR_RANGE = 5         # 沿路径向前探测冰鉴的跳数
 
-# 马 — 尽早使用减帧
-HORSE_MIN_REMAINING_DISTANCE = 15  # 剩余距离 > 15 即用马
+# 马 — 尽早使用
+HORSE_MIN_REMAINING_DISTANCE = 15
 
 # 急策 — RUSH 立即护果
-RUSH_PROTECT_BELOW = 99.0       # RUSH 阶段立即护果
+RUSH_PROTECT_BELOW = 99.0
 
-# 安全余量
-DELIVER_TIME_MARGIN = 8          # 交付时间安全余量（帧）
+# 安全余量 — 对方 r561 仍交付，600 帧上限下允许更从容
+DELIVER_TIME_MARGIN = 5          # 交付时间安全余量（帧）
 
-# 任务 — 不绕路做任务，鲜度优先
-SKIP_TASK_TEMPLATES = ("T04", "T06")  # 跳过：T04 需障碍上下文，T06 需消耗马
-TASK_DETOUR_MAX_EXTRA = 15       # 绕路做任务最大额外帧（几乎不绕）
+# 任务 — 对方任务分 165、鲜度 88。我方任务 180、鲜度 74。
+# 教训：任务绕路换来的 15 分，被鲜度损失 25 分反超。不再绕路做任务。
+SKIP_TASK_TEMPLATES = ("T04", "T06")
+TASK_DETOUR_MAX_EXTRA = 0        # 不绕路做任务（对方教训）
 
-# 对抗 — 好果优先保护
-KEEP_GOOD_FRUIT_MIN = 3          # 攻坚/清障后最低好果（不轻易消耗）
-GATE_SCOUT_MIN_FRAMES = 8        # 小分队探路宫门最小剩余帧
-GATE_SCOUT_MAX_FRAMES = 40       # 最大剩余帧
-INTEL_RANGE = 15                 # 情报射程上限（累计路线距离）
-REROUTE_VS_CLEAR_EXTRA = 20      # 绕行多出此帧数改清障
-SQUAD_AHEAD_MIN_HOPS = 2         # 小分队预清障最小跳跃数
-REJECT_BLOCK_ROUNDS = 4          # 拒绝反馈拉黑帧数
-ENABLE_OFFENSIVE = False         # 主动设卡开关（delivery-first，默认关）
-FP_RETRY_LIMIT = 4               # FORCED_PASS 连续失败上限
-FP_RETRY_COOLDOWN = 30           # FORCED_PASS 冷却帧数
+# 对抗 — 好果即分数，不清障
+KEEP_GOOD_FRUIT_MIN = 98         # 永远不清障（对方好果 99，我方 97）
+GATE_SCOUT_MIN_FRAMES = 8
+GATE_SCOUT_MAX_FRAMES = 40
+INTEL_RANGE = 15
+REROUTE_VS_CLEAR_EXTRA = 100     # 永远绕行不清障
+SQUAD_AHEAD_MIN_HOPS = 2
+REJECT_BLOCK_ROUNDS = 4
+ENABLE_OFFENSIVE = False
+FP_RETRY_LIMIT = 1               # 立即强制通行
+FP_RETRY_COOLDOWN = 10           # 缩短冷却
 
-# 鲜度感知路由 v4.3：目标到达鲜度 85%
-FRESHNESS_FIRST_MAX_EXTRA = 80       # 换鲜度更优路线最多额外帧数
-FRESHNESS_ROUTE_SLACK = 30           # 剩余帧 > 最快路径 + 此值即启用鲜度路由
-TARGET_DELIVER_ROUND = 460           # 目标交付回合
-TARGET_FRESHNESS = 85.0              # 目标到达鲜度
+# 鲜度感知路由 v4.4 — 对方走官道/水路绕行拿下 88 鲜度
+FRESHNESS_FIRST_MAX_EXTRA = 120      # 允许大幅绕行换鲜度
+FRESHNESS_ROUTE_SLACK = 10           # 几乎总是启用鲜度路由
+TARGET_DELIVER_ROUND = 560           # 目标交付回合（对齐对方 r561）
+TARGET_FRESHNESS = 88.0              # 目标到达鲜度（对齐对方 88.57）

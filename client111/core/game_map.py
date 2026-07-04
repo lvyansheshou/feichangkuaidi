@@ -235,15 +235,16 @@ class GameMap:
                                 freshness_weight=1.0):
         """鲜度+时间平衡最短路径 (path, frames)。
 
-        边权 = 帧数 + freshness_weight × 预估鲜度损耗帧当量。
-        freshness_weight 越大越倾向于低鲜度损耗路线（水路 > 官道 > 山路）。
+        边权 = 帧数 + freshness_weight × 鲜度损耗惩罚。
+        以 WATER=0.045 为基准（最优路线），其他路线按超出的损耗比例惩罚。
+        即：WATER 无惩罚，ROAD +22%，BRANCH +44%，MOUNTAIN +56%。
 
-        鲜度损耗帧当量 = 帧数 × 路线损耗率 / 基准损耗率
-        基准取 ROAD=0.055，即 ROAD 边无惩罚，MOUNTAIN 边受惩罚。
+        对方走官道绕行避开山路，到达鲜度 88.57 — 这就是惩罚山路的效果。
         """
         blocked = blocked or frozenset()
-        BASE_LOSS = 0.055  # ROAD 基准
-        ROUTE_LOSS = {"ROAD": 0.055, "WATER": 0.045, "MOUNTAIN": 0.07, "BRANCH": 0.065}
+        # v4.4: 以 WATER 为基准（最优鲜度路线），增大山路惩罚
+        BASE_LOSS = 0.045  # WATER 基准（对方策略核心）
+        ROUTE_LOSS = {"WATER": 0.045, "ROAD": 0.055, "BRANCH": 0.065, "MOUNTAIN": 0.07}
 
         adj = {}
         for e in self.edges:
@@ -251,7 +252,7 @@ class GameMap:
                                           rules.BASE_MOVE_NONE)
             proc = self._proc_cost(e.to_node)
 
-            # 鲜度调整：高于基准的路线类型加惩罚
+            # 鲜度惩罚：超出 WATER 基准的部分
             loss_rate = ROUTE_LOSS.get(e.route_type, 0.06)
             freshness_penalty = frames * max(0, (loss_rate - BASE_LOSS) / BASE_LOSS)
             weight = frames + proc + freshness_weight * freshness_penalty
@@ -263,7 +264,6 @@ class GameMap:
 
         path, cost = pathfind.shortest_path(adj, source, target)
         if path:
-            # 返回真实帧数（非加权后）
             _, real_frames = self.time_optimal_path(source, target, blocked)
             return path, real_frames
         return path, cost

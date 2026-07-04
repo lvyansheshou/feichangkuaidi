@@ -356,10 +356,9 @@ class DecisionEngine:
         return None
 
     def _find_ice_on_route(self, world, me, gm, node, terminal):
-        """v4.3: 在前方路径上找冰鉴资源。冰鉴不足时主动探测。
+        """v4.4: 激进冰鉴探测。沿路径搜索 config.ICE_BOX_DETOUR_RANGE 跳。
 
-        沿时间最优路径向前看 3 跳，如果有节点提供冰鉴且距路径不远，
-        返回 CLAIM_RESOURCE 动作（稍微绕路去领）。
+        对方用了 2+ 次冰鉴才保 88 鲜度。我方必须确保充足冰鉴。
         """
         if me.resource_count(ResourceType.ICE_BOX) >= config.CLAIM_ICE_BOX_KEEP:
             return None
@@ -368,17 +367,14 @@ class DecisionEngine:
         path, _ = gm.time_optimal_path(node, terminal)
         if not path or len(path) < 2:
             return None
-        # 沿路径向前看
-        for i in range(1, min(4, len(path))):
+        max_range = min(config.ICE_BOX_DETOUR_RANGE, len(path))
+        for i in range(1, max_range):
             nid = path[i]
             ns = world.node(nid)
             if ns and ns.resource_available(ResourceType.ICE_BOX):
-                # 该节点在路径上且可领冰鉴
                 if nid == path[1]:
-                    # 下一跳就是 → 到达时自然会领
-                    return None
-                # 需要稍微绕路 → 领了再回来
-                if self._can_afford(world, gm, node, 3, terminal):
+                    return None  # 下一跳到达时自然领
+                if self._can_afford(world, gm, node, 4, terminal):
                     return actions.claim_resource(nid, ResourceType.ICE_BOX)
         return None
 
@@ -516,19 +512,19 @@ class DecisionEngine:
         # 路径3: 时间最优（仅障碍/守卫阻塞）
         path_safe, cost_safe = gm.time_optimal_path(src, dst, blocked=blocked)
 
-        # ── 动态鲜度权重（目标 85%）──
+        # ── 动态鲜度权重（v4.4: 对齐对方策略，目标鲜度 88%）──
         remaining_budget = duration - current_round - config.DELIVER_TIME_MARGIN
-        # 距目标鲜度越远 → 越急迫
-        freshness_gap = max(0, me.freshness - config.TARGET_FRESHNESS)
-        freshness_urgency = max(0.5, (100 - me.freshness) / 20.0)
-        # 时间越充裕 → 权重越大
+        # 鲜度距目标越远 → 越急迫地选低损耗路线
+        freshness_urgency = max(1.5, (100 - me.freshness) / 15.0)
+        # 时间越充裕 → 权重越大（对方 r561 到达，我们接受 r560）
         if cost_base > 0 and remaining_budget > cost_base:
-            time_slack = min(3.0, (remaining_budget - cost_base) / max(1, cost_base) * 2)
+            time_slack = min(4.0, (remaining_budget - cost_base) / max(1, cost_base) * 3)
         else:
             time_slack = 0
-        # 天气加剧鲜度损耗 → 权重加大
-        weather_bonus = 1.5 if active_wt in ("HOT", "MOUNTAIN_FOG") else 0
-        fw = min(5.0, max(1.0, freshness_urgency + time_slack + weather_bonus))
+        # 天气加剧 → 更保守的路线
+        weather_bonus = 2.0 if active_wt in ("HOT", "MOUNTAIN_FOG") else 0
+        # v4.4: 基础权重提高到 2.0，范围 2.0 ~ 8.0
+        fw = min(8.0, max(2.0, freshness_urgency + time_slack + weather_bonus))
 
         # ── 路径4: 鲜度+时间平衡 ──
         path_fresh = None
@@ -768,39 +764,20 @@ class DecisionEngine:
         return self._cooldown.get(nid, 0) > (world.round or 0)
 
     def _breakthrough(self, world, me, gm, nxt, terminal):
-        """v4.2: 优先保护好果。能绕就绕，能冲就冲，不清障/不攻坚。"""
+        """v4.4: 永远不清障/不攻坚。好果即分数（对方好果 99）。"""
         ns = world.node(nxt)
         if ns and ns.has_obstacle:
+            # 有 T04 任务且不消耗好果 → 可以做
             t04 = self._find_t04(world, nxt)
             if t04:
                 self._fp_failures.pop(nxt, None)
                 return [actions.claim_task(t04.get("taskId"))]
-            # v4.2: 只有好果充裕(>4)才清障，否则强制通行
-            if me.good_fruit > config.KEEP_GOOD_FRUIT_MIN + 1:
-                self._fp_failures.pop(nxt, None)
-                return [actions.clear_obstacle(nxt)]
+            # 直接强制通行（对方策略：不清障）
             return [actions.forced_pass(nxt)]
 
         owner = ns.active_guard_owner() if ns else None
         if owner and owner != me.team_id:
-            plan = self._plan_attack(me, ns)
-            if plan is not None:
-                # v4.2: 只有消耗低(≤1好果)才攻坚
-                g_used = plan[0]
-                if g_used <= 1:
-                    self._fp_failures.pop(nxt, None)
-                    g, b, bo = plan
-                    return [actions.break_guard(nxt, good_fruit=g, bad_fruit=b,
-                                               rush_tactic=(Action.BREAK_ORDER if bo else None))]
-            # 攻击不可行或代价太高 → 强制通行
-            fails = self._fp_failures.get(nxt, 0)
-            if fails >= config.FP_RETRY_LIMIT:
-                if fails >= config.FP_RETRY_LIMIT + config.FP_RETRY_COOLDOWN:
-                    self._fp_failures.pop(nxt, None)
-                    return [actions.forced_pass(nxt)]
-                self._fp_failures[nxt] = fails + 1
-                return []
-            self._fp_failures[nxt] = fails + 1
+            # 直接强制通行（不清障策略的延续）
             return [actions.forced_pass(nxt)]
 
         return [actions.move(nxt)]
