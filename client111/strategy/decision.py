@@ -155,9 +155,13 @@ class DecisionEngine:
                 return self._opportunistic(world, me, gm, node, terminal) or []
             return self._advance(world, me, gm, node, terminal, terminal)
 
-        # 固定处理站点
+        # v4.5fix: 冰鉴/资源优先领取（抢在对手前面！）
+        opp = self._opportunistic(world, me, gm, node, terminal)
+        if opp:
+            return opp
+
+        # 固定处理站点（资源领完再处理）
         if node in gm.process_nodes and not self._processed_here:
-            # v4.5fix: 博弈中断处理→3次尝试或30帧超时后放弃
             stuck_rounds = (world.round or 0) - self._node_since_round
             if self._process_attempts >= 3 or stuck_rounds > 30:
                 self._processed_here = True
@@ -179,14 +183,10 @@ class DecisionEngine:
         if speed:
             return [speed]
 
-        # v3: T04 任务（障碍节点）优先于普通任务
+        # v3: T04 任务
         t04 = self._maybe_t04_task(world, me, gm, node, terminal)
         if t04:
             return [t04]
-
-        opp = self._opportunistic(world, me, gm, node, terminal)
-        if opp:
-            return opp
 
         # v4.5: 智能进攻设卡（demo移植）
         guard = self._maybe_offensive_guard(world, me, gm, node, terminal)
