@@ -65,7 +65,13 @@ INTEL_RANGE = 15
 REROUTE_VS_CLEAR_EXTRA = 20        # 绕行>此帧数改清障
 SQUAD_AHEAD_MIN_HOPS = 2
 REJECT_BLOCK_ROUNDS = 4
-ENABLE_OFFENSIVE = False           # 进攻设卡(暂关，后续迭代)
+ENABLE_OFFENSIVE = True            # v4.5: 智能进攻设卡（demo移植）
+OFFENSIVE_GOOD_FRUIT_KEEP = 30     # 设卡投入后最低好果（保交付分）
+OFFENSIVE_EXTRA_GOOD = 1           # 关键关隘设卡额外好果
+OFFENSIVE_MIN_OPP_DELAY = 18       # 预期拖延对手帧数下限
+OFFENSIVE_LEAD_SKIP = True         # 领先时回避设卡（防悬赏）
+SET_GUARD_PROCESS_FRAMES = 4       # 设卡处理帧数
+SQUAD_REINFORCE_ENABLED = True     # 小分队增援己方设卡
 FP_RETRY_LIMIT = 4
 FP_RETRY_COOLDOWN = 30
 

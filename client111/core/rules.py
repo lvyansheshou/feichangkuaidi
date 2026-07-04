@@ -110,6 +110,8 @@ FRESHNESS_WEATHER_COEF = {"HOT": 1.5, "HEAVY_RAIN": 1.3, "MOUNTAIN_FOG": 1.0}
 
 # 障碍时间税
 OBSTACLE_TIME_TAX = 8
+SET_GUARD_PROCESS_FRAMES = 4
+NODE_MAX_DEFENSE = {"normal": 6, "key_pass": 7, "gate": 4, "obstacle_node": 5}
 
 
 def freshness_loss_per_frame(state, route_type=None, weather_type=None,

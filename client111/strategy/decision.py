@@ -54,6 +54,8 @@ class DecisionEngine:
         self._window_played = {}     # v4.5: contestId -> {roundIndex} 已出牌拍次
         self._triggered = set()      # v4.5: 已触发的好果转坏阈值
         self._prev_freshness = None  # v4.5: 上一帧鲜度
+        self._offensive_guard_node = None  # v4.5: 已种卡节点（防重发）
+        self._reinforced_guards = set()   # v4.5: 已增援的设卡节点
         self._task_base = 0
         self._completed_task_ids = set()
         self._task_attempted = set()    # v4.3: 已尝试过的任务（防重试风暴）
@@ -134,8 +136,10 @@ class DecisionEngine:
         if gate and node == gate:
             if not me.verified:
                 if world.is_rush:
+                    # v4.5fix: BREAK_ORDER仅在鲜度充足时使用（否则留给护果令）
                     bo = (Action.BREAK_ORDER
                           if (me.rush_tactic_used_count or 0) == 0
+                          and me.freshness >= config.RUSH_PROTECT_FRESHNESS_BELOW
                           and (me.bad_fruit >= 2 or me.good_fruit > config.KEEP_GOOD_FRUIT_MIN)
                           else None)
                     return [actions.verify_gate(rush_tactic=bo)]
@@ -170,6 +174,11 @@ class DecisionEngine:
         opp = self._opportunistic(world, me, gm, node, terminal)
         if opp:
             return opp
+
+        # v4.5: 智能进攻设卡（demo移植）
+        guard = self._maybe_offensive_guard(world, me, gm, node, terminal)
+        if guard:
+            return [guard]
 
         # v4.5: 后期前置宫门（demo RUSH_PREPOSITION_ROUND）
         route_dst = self._late_route_target(world, me, gate, terminal)
@@ -992,18 +1001,102 @@ class DecisionEngine:
         return avail[0] if avail else Card.ABSTAIN
 
     # ================================================================
-    #  v3: 小分队（主动清障 + 探路宫门）
+    #  v4.5: 智能进攻设卡 + 小分队增援（demo 移植）
+    # ================================================================
+
+    def _node_kind(self, gm, node_id):
+        n = gm.node(node_id)
+        if n is None: return "normal"
+        if node_id == gm.gate_node: return "gate"
+        if n.type == "KEY_PASS": return "key_pass"
+        return "normal"
+
+    def _node_max_defense(self, gm, node_id):
+        return r.NODE_MAX_DEFENSE.get(self._node_kind(gm, node_id), 6)
+
+    def _own_active_guards(self, world, me):
+        out = []
+        for nid, ns in world.node_states.items():
+            if ns.active_guard_owner() == me.team_id:
+                out.append((nid, ns))
+        return out
+
+    def _am_leading(self, world, me):
+        opp = world.opponent
+        if opp is None: return False
+        return (me.total_score or 0) > (opp.total_score or 0)
+
+    def _opp_will_pass(self, world, opp, gm, node, terminal):
+        src = opp.current_node_id
+        if not src or src == terminal or src == node:
+            return False
+        path, _ = self._time_path(world, src, terminal, blocked=self._blocked_nodes(world, world.me))
+        if not path:
+            path, _ = self._time_path(world, src, terminal)
+        if not path:
+            return False
+        return node in path
+
+    def _maybe_offensive_guard(self, world, me, gm, node, terminal):
+        """v4.5: 智能设卡 — 在对手必经关隘种卡拖延对手（demo移植）。"""
+        if not config.ENABLE_OFFENSIVE or world.is_rush or me.delivered or terminal is None:
+            return None
+        n = gm.node(node)
+        if n is None or n.type != "KEY_PASS":
+            return None
+        if node == self._offensive_guard_node:
+            return None
+        ns = world.node(node)
+        if ns and ns.active_guard_owner() is not None:
+            return None
+        if len(self._own_active_guards(world, me)) >= 2:
+            return None
+        if not self._can_afford(world, gm, node, config.SET_GUARD_PROCESS_FRAMES, terminal):
+            return None
+        extra = config.OFFENSIVE_EXTRA_GOOD
+        if me.good_fruit - extra < config.OFFENSIVE_GOOD_FRUIT_KEEP:
+            return None
+        opp = world.opponent
+        if opp is None or opp.delivered or opp.retired:
+            return None
+        if not self._opp_will_pass(world, opp, gm, node, terminal):
+            return None
+        defense = r.guard_defense(extra, self._node_max_defense(gm, node))
+        if r.guard_time_tax(self._node_kind(gm, node), defense) < config.OFFENSIVE_MIN_OPP_DELAY:
+            return None
+        if config.OFFENSIVE_LEAD_SKIP and self._am_leading(world, me):
+            return None
+        self._offensive_guard_node = node
+        return actions.set_guard(node, extra_good_fruit=extra)
+
+    def _maybe_reinforce(self, world, me, gm):
+        """v4.5: 增援己方设卡 +2防御（demo移植）。"""
+        best, best_deficit = None, 0
+        for nid, ns in self._own_active_guards(world, me):
+            if nid in self._reinforced_guards:
+                continue
+            defense = (ns.guard or {}).get("defense", 0) or 0
+            deficit = self._node_max_defense(gm, nid) - defense
+            if deficit > 0 and (best is None or deficit > best_deficit):
+                best, best_deficit = nid, deficit
+        if best is None:
+            return None
+        self._reinforced_guards.add(best)
+        return actions.squad_reinforce(best)
+
+    # ================================================================
+    #  v3: 小分队（主动清障 + 探路宫门 + 增援）
     # ================================================================
 
     def _maybe_squad_v3(self, world, me, gm, node, terminal):
-        """v3 小分队：优先清障、其次探路宫门。"""
+        """v4.5 小分队：清障 → 设卡增援 → 探路宫门。"""
         if world.is_rush:
             return None
         avail = me.squad_available or 0
         if avail <= 0:
             return None
 
-        # v3: 优先 SQUAD_CLEAR 前方障碍
+        # 优先 SQUAD_CLEAR 前方障碍（≥2队）
         if avail >= 2:
             obstacle_ahead = self._find_obstacle_ahead(world, gm, node, terminal)
             if obstacle_ahead:
@@ -1011,6 +1104,12 @@ class DecisionEngine:
                 if key not in self._squad_sent:
                     self._squad_sent.add(key)
                     return actions.squad_clear(obstacle_ahead)
+
+        # v4.5: 增援己方设卡（≥2队，demo移植）
+        if config.SQUAD_REINFORCE_ENABLED and avail >= 2:
+            reinforce = self._maybe_reinforce(world, me, gm)
+            if reinforce:
+                return reinforce
 
         # 探路宫门
         if avail >= 1:
