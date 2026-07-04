@@ -51,6 +51,9 @@ class DecisionEngine:
         self._gate_scout_sent = False
         self._last_main_action = None
         self._fp_failures = {}
+        self._window_played = {}     # v4.5: contestId -> {roundIndex} 已出牌拍次
+        self._triggered = set()      # v4.5: 已触发的好果转坏阈值
+        self._prev_freshness = None  # v4.5: 上一帧鲜度
         self._task_base = 0
         self._completed_task_ids = set()
         self._task_attempted = set()    # v4.3: 已尝试过的任务（防重试风暴）
@@ -883,34 +886,130 @@ class DecisionEngine:
         return best
 
     # ================================================================
-    #  窗口出牌
+    #  窗口出牌 v4.5: 反应式 3 拍（移植 demo 对手策略）
     # ================================================================
 
+    # 牌克制矩阵（§5.4.4）：BEATS[对手牌] = 克制它的牌（按成本从低到高）
+    _BEATS = {
+        Card.YAN_DIE: (Card.XIAN_GONG, Card.BING_ZHENG),
+        Card.QIANG_XING: (Card.YAN_DIE, Card.BING_ZHENG),
+        Card.XIAN_GONG: (Card.QIANG_XING,),
+        Card.BING_ZHENG: (Card.XIAN_GONG,),
+    }
+    _STAKES_RANK = {"GATE": 3, "PASS": 3, "TASK": 2, "OBSTACLE": 2, "DOCK": 1, "RESOURCE": 1}
+
     def _window_card(self, world, me):
-        contests = world.my_contests()
+        """v4.5: 反应式 3 拍出牌（demo 对手策略）。
+
+        读对手上一拍牌，按筹码分级、克制矩阵反制。
+        胜负已定则弃权省成本。同帧多窗口选最高筹码者。
+        """
+        contests = self._my_active_contests(world)
         if not contests:
             return None
         c = contests[0]
         cid = c.get("contestId")
         if not cid:
             return None
-        available = []
-        if (me.guard_action_point or 0) > 0:
-            available.append(Card.BING_ZHENG)
-        # v4.2: XIAN_GONG 仅在好果充裕(>5)时使用
-        if me.freshness >= 80 and me.good_fruit > config.KEEP_GOOD_FRUIT_MIN + 2:
-            available.append(Card.XIAN_GONG)
+        ri = c.get("roundIndex") or 1
+        played = self._window_played.get(cid)
+        if played and ri in played:
+            return None
+
+        my_color = self._my_color(c)
+        my_pt, opp_pt = self._points(c, my_color)
+        stakes = self._stakes(c)
+        allow_bing = stakes >= 3 and (me.guard_action_point or 0) > 0
+        allow_xian = stakes >= 2 and me.freshness >= 80 \
+            and me.good_fruit >= config.KEEP_GOOD_FRUIT_MIN + 1
+        avail = self._available_cards(me, allow_bing, allow_xian)
+
+        if my_pt >= 2 or opp_pt >= 2:
+            card = Card.ABSTAIN
+        else:
+            opp_card = self._opp_last_card(world, c, my_color)
+            if ri >= 2 and opp_card and opp_card != Card.ABSTAIN:
+                card = self._pick_counter(opp_card, avail)
+                if card is None and opp_card in avail:
+                    card = opp_card
+                elif card is None:
+                    card = Card.ABSTAIN
+            else:
+                card = self._lead_card(me, avail, stakes >= 3)
+
+        self._window_played.setdefault(cid, set()).add(ri)
+        return actions.window_card(cid, card)
+
+    def _my_active_contests(self, world):
+        contests = world.my_contests()
+        if not contests:
+            return []
+        active_ids = {c.get("contestId") for c in contests}
+        for cid in list(self._window_played):
+            if cid not in active_ids:
+                del self._window_played[cid]
+        return sorted(contests, key=self._stakes, reverse=True)
+
+    def _stakes(self, c):
+        return self._STAKES_RANK.get(c.get("contestType"), 1)
+
+    def _my_color(self, c):
+        return "RED" if c.get("redPlayerId") == self.ctx.player_id else "BLUE"
+
+    def _points(self, c, my_color):
+        if my_color == "RED":
+            return (c.get("redPoint") or 0, c.get("bluePoint") or 0)
+        return (c.get("bluePoint") or 0, c.get("redPoint") or 0)
+
+    def _opp_last_card(self, world, c, my_color):
+        opp_color = "BLUE" if my_color == "RED" else "RED"
+        cid = c.get("contestId")
+        best_ri, best_card = -1, None
+        for e in world.events:
+            if e.get("type") != "WINDOW_CARD_REVEAL":
+                continue
+            p = e.get("payload") or {}
+            if p.get("contestId") != cid:
+                continue
+            eri = p.get("roundIndex")
+            if eri is not None and eri > best_ri:
+                best_ri = eri
+                best_card = p.get("redCard") if opp_color == "RED" else p.get("blueCard")
+        if best_card:
+            return best_card
+        cards = c.get("cards") or {}
+        return cards.get(opp_color)
+
+    def _available_cards(self, me, allow_bing, allow_xian):
+        avail = []
+        if allow_bing:
+            avail.append(Card.BING_ZHENG)
+        if allow_xian:
+            avail.append(Card.XIAN_GONG)
         if me.resource_count(ResourceType.PASS_TOKEN) > 0 \
                 or me.resource_count(ResourceType.OFFICIAL_PERMIT) > 0:
-            available.append(Card.YAN_DIE)
-        if self._has_any_horse(me):
-            available.append(Card.QIANG_XING)
-        if not available:
-            return actions.window_card(cid, Card.ABSTAIN)
-        for card in [Card.BING_ZHENG, Card.XIAN_GONG, Card.YAN_DIE, Card.QIANG_XING]:
-            if card in available:
-                return actions.window_card(cid, card)
-        return actions.window_card(cid, Card.ABSTAIN)
+            avail.append(Card.YAN_DIE)
+        if self._has_move_buff(me) or self._has_any_horse(me):
+            avail.append(Card.QIANG_XING)
+        return avail
+
+    def _pick_counter(self, opp_card, avail):
+        for card in self._BEATS.get(opp_card, ()):
+            if card in avail:
+                return card
+        return None
+
+    def _lead_card(self, me, avail, stakes_high):
+        if stakes_high:
+            for card in (Card.BING_ZHENG, Card.XIAN_GONG, Card.QIANG_XING, Card.YAN_DIE):
+                if card in avail:
+                    return card
+        else:
+            if self._has_move_buff(me) and Card.QIANG_XING in avail:
+                return Card.QIANG_XING
+            if Card.YAN_DIE in avail:
+                return Card.YAN_DIE
+        return avail[0] if avail else Card.ABSTAIN
 
     # ================================================================
     #  v3: 小分队（主动清障 + 探路宫门）
