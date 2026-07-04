@@ -37,9 +37,9 @@ ICE_BOX_LEAD = 7.0                 # （保留兼容）
 ICE_BOX_HOT_USE_BELOW = 88.0       # （保留兼容）
 CLAIM_ICE_BOX_KEEP = 3             # 期望至少持有的冰鉴数
 ICE_BOX_DETOUR_KEEP = 2            # 绕路收集冰鉴的目标持有量（达到即停）
-ICE_BOX_DETOUR_PROJECTED_BELOW = 85.0  # 投影交付鲜度低于此才绕路领冰鉴
-ICE_BOX_DETOUR_MAX_EXTRA_FRAMES = 60   # 绕路领冰鉴最大额外帧
-ICE_BOX_DETOUR_NET_MIN = 6.0       # 绕路领冰鉴净鲜度收益下限（+10 - 绕路损耗 ≥ 此值）
+ICE_BOX_DETOUR_PROJECTED_BELOW = 92.0  # v4.5fix: 投影鲜度<92即绕路领冰鉴（原85过严，第2场0冰鉴）
+ICE_BOX_DETOUR_MAX_EXTRA_FRAMES = 80   # v4.5fix: 放宽绕路预算，冰鉴+10值得多花20帧
+ICE_BOX_DETOUR_NET_MIN = 4.0       # v4.5fix: 净收益≥4即可绕（原6过严，官道路线损耗低时仍可绕）
 
 # -- 马 --
 HORSE_MIN_REMAINING_DISTANCE = 30
@@ -78,5 +78,6 @@ FRESHNESS_LOSS_ASSUME = 0.06       # 鲜度预算估算用每帧损耗(保守)
 RUSH_PREPOSITION_ROUND = 360       # 此帧后未验核→直奔宫门
 
 # -- 目标 --
-TARGET_DELIVER_ROUND = 560
+TARGET_DELIVER_ROUND = 540           # v4.5fix: 降低目标交付回合（原560过宽，第1场官道未到达）
 TARGET_FRESHNESS = 88.0
+MAX_DELIVER_ROUND_HARD = 580         # v4.5fix: 硬性上限，超过此值强制退回时间最优路径

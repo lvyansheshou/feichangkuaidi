@@ -575,19 +575,21 @@ class DecisionEngine:
         # 路径3: 时间最优（仅障碍/守卫阻塞）
         path_safe, cost_safe = gm.time_optimal_path(src, dst, blocked=blocked)
 
-        # ── 动态鲜度权重（v4.4: 对齐对方策略，目标鲜度 88%）──
+        # ── 动态鲜度权重 + 时间硬约束（v4.5fix）──
         remaining_budget = duration - current_round - config.DELIVER_TIME_SAFETY_MARGIN
-        # 鲜度距目标越远 → 越急迫地选低损耗路线
-        freshness_urgency = max(1.5, (100 - me.freshness) / 15.0)
-        # 时间越充裕 → 权重越大（对方 r561 到达，我们接受 r560）
-        if cost_base > 0 and remaining_budget > cost_base:
-            time_slack = min(4.0, (remaining_budget - cost_base) / max(1, cost_base) * 3)
+        # v4.5fix: 时间硬约束——预估到达回合超过上限则强制退回时间最优
+        estimated_arrival = current_round + cost_base
+        if estimated_arrival > config.MAX_DELIVER_ROUND_HARD:
+            # 官道路线太慢！强制使用纯时间最优（无鲜度惩罚）
+            fw = 0.0
         else:
-            time_slack = 0
-        # 天气加剧 → 更保守的路线
-        weather_bonus = 2.0 if active_wt in ("HOT", "MOUNTAIN_FOG") else 0
-        # v4.4: 基础权重提高到 2.0，范围 2.0 ~ 8.0
-        fw = min(8.0, max(2.0, freshness_urgency + time_slack + weather_bonus))
+            freshness_urgency = max(1.5, (100 - me.freshness) / 15.0)
+            if cost_base > 0 and remaining_budget > cost_base:
+                time_slack = min(4.0, (remaining_budget - cost_base) / max(1, cost_base) * 3)
+            else:
+                time_slack = 0
+            weather_bonus = 2.0 if active_wt in ("HOT", "MOUNTAIN_FOG") else 0
+            fw = min(8.0, max(2.0, freshness_urgency + time_slack + weather_bonus))
 
         # ── 路径4: 鲜度+时间平衡 ──
         path_fresh = None
