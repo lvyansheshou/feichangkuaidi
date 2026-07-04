@@ -56,6 +56,7 @@ class DecisionEngine:
         self._prev_freshness = None  # v4.5: 上一帧鲜度
         self._offensive_guard_node = None  # v4.5: 已种卡节点（防重发）
         self._reinforced_guards = set()   # v4.5: 已增援的设卡节点
+        self._process_attempts = 0        # v4.5fix: 处理尝试次数（防无限博弈卡死）
         self._task_base = 0
         self._completed_task_ids = set()
         self._task_attempted = set()    # v4.3: 已尝试过的任务（防重试风暴）
@@ -156,7 +157,13 @@ class DecisionEngine:
 
         # 固定处理站点
         if node in gm.process_nodes and not self._processed_here:
-            return [actions.process()]
+            # v4.5fix: 频繁博弈中断处理→放弃处理，直接前进
+            if self._process_attempts >= 8:
+                self._processed_here = True  # 强制标记已处理
+                self._process_attempts = 0
+            else:
+                self._process_attempts += 1
+                return [actions.process()]
 
         # 情报
         intel = self._maybe_intel(world, me, gm, node, terminal)
@@ -1270,6 +1277,7 @@ class DecisionEngine:
         if node != self._stay_node:
             self._stay_node = node
             self._processed_here = False
+            self._process_attempts = 0  # v4.5fix: 新节点重置计数器
         gm = self.ctx.game_map
         is_proc_node = gm is not None and node in gm.process_nodes
         transition_done = (is_proc_node
