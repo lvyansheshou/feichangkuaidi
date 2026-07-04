@@ -1,12 +1,14 @@
-r"""决策引擎 v4.1 — 时间预算 + 鲜度感知路由。
+r"""决策引擎 v4.2 — 鲜度 + 好果最高优先。
 
-核心思路：平均对局 ~460 回合。在此预算内，优先选择
-鲜度损耗最低的路径，而非仅追求最快到达。
+1 鲜度 ≈ 1.8 分，1 好果 ≈ 1.8 分。两者是得分核心，
+优先级高于快速交付、任务绕路、窗口博弈。
 
-v4→v4.1:
-  1. 时间预算感知: 估算剩余帧是否充裕，充裕时选鲜度更优路径
-  2. 鲜度路由阈值: 鲜度优先路径必须能在预算内到达终点
-  3. 每帧鲜度 ≈ 1.8 分，省鲜度即省分
+v4.1→v4.2:
+  1. 冰鉴阈值 94: 鲜度刚跌就用冰鉴，几乎不等待
+  2. 好果保护 3: 清障/攻坚至少保留 3 好果，宁愿绕行
+  3. RUSH 立即护果: 鲜度 < 98 即用护果令
+  4. 任务绕路降到 20 帧: 鲜度损失 > 任务收益
+  5. 障碍优先绕行: 省好果，宁多花几帧
 """
 
 import math
@@ -53,7 +55,7 @@ class DecisionEngine:
         self._task_base = 0
         self._completed_task_ids = set()
         # v3: 障碍绕行预算
-        self._obstacle_detour_budget = 15  # 绕行≤15帧就绕，>15帧就清障
+        self._obstacle_detour_budget = 25  # v4.2: 绕行≤25帧就绕，省好果优先
 
     # ================================================================
     #  主入口
@@ -205,43 +207,41 @@ class DecisionEngine:
     # ================================================================
 
     def _freshness_rescue_v2(self, me, world=None):
-        """v4: 激进冰鉴策略。鲜度优先——宁可早用、多用，不可浪费冰鉴价值。
+        """v4.2: 冰鉴最高优先。鲜度 < 94 即用，几乎不等待。
 
-        冰鉴 +10 鲜度 ≈ 18 分，远超过大多数其他决策的边际收益。
+        冰鉴 +10 鲜度 ≈ 18 分。早用 = 早保住鲜度分。
         """
         ice = me.resource_count(ResourceType.ICE_BOX)
         if ice <= 0 or me.freshness <= 0:
             return None
 
+        # 直接阈值触发（94，比 v4 的 88 再高 6 点）
+        if me.freshness < config.ICE_BOX_USE_BELOW:
+            return actions.use_resource(ResourceType.ICE_BOX)
+
+        # 预判转坏：距下一阈值 ≤ 8 帧时提前用
         est_loss = 0.065
         wt = world.active_weather_type() if world else None
         if wt == "HOT":
             est_loss = 0.065 * 1.5
         elif wt == "MOUNTAIN_FOG":
             est_loss = 0.07
-
-        # v4: 覆盖更多阈值——不仅防转坏，更要保高分
-        for threshold in (95, 90, 85, 80, 75, 70, 60, 50, 40, 30, 20, 10):
+        for threshold in (95, 90, 85, 80, 75, 70, 60, 50, 40):
             if me.freshness < threshold:
                 continue
             frames_to = (me.freshness - threshold) / max(est_loss, 0.001)
-            # v4: 放宽窗口——提前 1-5 帧用冰鉴，不只是 1-3 帧
-            if 1 <= frames_to <= 5:
+            if 1 <= frames_to <= 8:
                 return actions.use_resource(ResourceType.ICE_BOX)
 
-        # v4: 酷暑预告 → 提前冰鉴
+        # 酷暑预告 → 立即冰鉴
         if world is not None:
-            upcoming = world.upcoming_weather(within_frames=20)
+            upcoming = world.upcoming_weather(within_frames=25)
             if upcoming and upcoming.get("type") == "HOT":
-                if me.freshness < 92:
+                if me.freshness < 95:
                     return actions.use_resource(ResourceType.ICE_BOX)
 
-        # v4: 低于配置阈值直接使用（88，比 v3 的 78 高 10 点）
-        if me.freshness < config.ICE_BOX_USE_BELOW:
-            return actions.use_resource(ResourceType.ICE_BOX)
-
-        # v4: 有多余冰鉴且鲜度不算太高 → 提前用，别攒着
-        if ice >= 2 and me.freshness < 92:
+        # 有多余冰鉴 → 不攒，直接用
+        if ice >= 2 and me.freshness < 95:
             return actions.use_resource(ResourceType.ICE_BOX)
 
         return None
@@ -262,11 +262,10 @@ class DecisionEngine:
         return actions.use_resource(horse)
 
     def _maybe_rush_protect(self, world, me):
-        """v4: 激进护果令。RUSH 阶段鲜度 < 95 且 > 40 即用（v3: < 90）。"""
+        """v4.2: RUSH 立即护果。鲜度 < 98 且 > 30 即用。"""
         if not world.is_rush or me.delivered or (me.rush_tactic_used_count or 0) > 0:
             return None
-        # v4: 放宽下限至 40（v3: 50），护到最后
-        if me.freshness < config.RUSH_PROTECT_BELOW and me.freshness > 40:
+        if me.freshness < config.RUSH_PROTECT_BELOW and me.freshness > 30:
             return actions.rush_protect()
         return None
 
@@ -627,13 +626,15 @@ class DecisionEngine:
         return self._cooldown.get(nid, 0) > (world.round or 0)
 
     def _breakthrough(self, world, me, gm, nxt, terminal):
+        """v4.2: 优先保护好果。能绕就绕，能冲就冲，不清障/不攻坚。"""
         ns = world.node(nxt)
         if ns and ns.has_obstacle:
             t04 = self._find_t04(world, nxt)
             if t04:
                 self._fp_failures.pop(nxt, None)
                 return [actions.claim_task(t04.get("taskId"))]
-            if me.good_fruit > config.KEEP_GOOD_FRUIT_MIN:
+            # v4.2: 只有好果充裕(>4)才清障，否则强制通行
+            if me.good_fruit > config.KEEP_GOOD_FRUIT_MIN + 1:
                 self._fp_failures.pop(nxt, None)
                 return [actions.clear_obstacle(nxt)]
             return [actions.forced_pass(nxt)]
@@ -642,10 +643,14 @@ class DecisionEngine:
         if owner and owner != me.team_id:
             plan = self._plan_attack(me, ns)
             if plan is not None:
-                self._fp_failures.pop(nxt, None)
-                g, b, bo = plan
-                return [actions.break_guard(nxt, good_fruit=g, bad_fruit=b,
-                                           rush_tactic=(Action.BREAK_ORDER if bo else None))]
+                # v4.2: 只有消耗低(≤1好果)才攻坚
+                g_used = plan[0]
+                if g_used <= 1:
+                    self._fp_failures.pop(nxt, None)
+                    g, b, bo = plan
+                    return [actions.break_guard(nxt, good_fruit=g, bad_fruit=b,
+                                               rush_tactic=(Action.BREAK_ORDER if bo else None))]
+            # 攻击不可行或代价太高 → 强制通行
             fails = self._fp_failures.get(nxt, 0)
             if fails >= config.FP_RETRY_LIMIT:
                 if fails >= config.FP_RETRY_LIMIT + config.FP_RETRY_COOLDOWN:
@@ -699,7 +704,8 @@ class DecisionEngine:
         available = []
         if (me.guard_action_point or 0) > 0:
             available.append(Card.BING_ZHENG)
-        if me.freshness >= 80 and me.good_fruit > config.KEEP_GOOD_FRUIT_MIN:
+        # v4.2: XIAN_GONG 仅在好果充裕(>5)时使用
+        if me.freshness >= 80 and me.good_fruit > config.KEEP_GOOD_FRUIT_MIN + 2:
             available.append(Card.XIAN_GONG)
         if me.resource_count(ResourceType.PASS_TOKEN) > 0 \
                 or me.resource_count(ResourceType.OFFICIAL_PERMIT) > 0:
