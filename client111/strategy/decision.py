@@ -1,11 +1,12 @@
-r"""决策引擎 v5 — 激进对抗 + 鲜度优先。
+r"""决策引擎 v4 — 鲜度优先 + 得分最大化。
 
-v4→v5 改进（主动寻找对抗，而非纯竞速）:
-  1. 主动设卡: 在关键节点(chokepoint/山路入口)设卡阻碍对手
-  2. 激进窗口博弈: 优先XIAN_GONG抢攻，YAN_DIE消耗对手资源
-  3. 小分队骚扰: SQUAD_DISPATCH骚扰对手路径
-  4. 攻坚增强: 降低好果保留阈值，允许更多果实投入攻坚
-  5. 对抗感知: 领先时设卡拖慢对手，落后时破卡追击
+v3→v4 改进（优先鲜度和得分，而非仅追求快速交付）:
+  1. 鲜度感知路由: 优先选择鲜度损耗低的路线（水路 > 官道 > 山路）
+  2. 激进冰鉴: 更高鲜度阈值使用冰鉴（88），保鲜度分
+  3. 降低绕路任务: 任务分有上限(180)，鲜度无上限 → 减少任务绕路
+  4. 提前护果令: RUSH 阶段鲜度 < 95 即用护果令
+  5. 多冰鉴策略: 保持至少 2 个冰鉴储备
+  6. 每帧鲜度 ≈ 1.8 分，任务绕路鲜度代价需纳入决策
 """
 
 import math
@@ -143,11 +144,6 @@ class DecisionEngine:
         intel = self._maybe_intel(world, me, gm, node, terminal)
         if intel:
             return [intel]
-
-        # v5: 主动设卡（领先时在关键节点阻碍对手）
-        guard = self._maybe_set_guard(world, me, gm, node, terminal)
-        if guard:
-            return [guard]
 
         # 急策
         rp = self._maybe_rush_protect(world, me)
@@ -669,61 +665,7 @@ class DecisionEngine:
     #  窗口出牌
     # ================================================================
 
-    # ================================================================
-    #  v5: 主动设卡
-    # ================================================================
-
-    def _maybe_set_guard(self, world, me, gm, node, terminal):
-        """v5: 在关键节点主动设卡阻碍对手。
-
-        条件: 启用进攻 + 鲜度/好果充足 + 当前节点是必经节点或关键路径节点。
-        """
-        if not config.ENABLE_OFFENSIVE:
-            return None
-        # 鲜度和好果不足时不设卡（保底优先）
-        if me.freshness < config.HARASS_MIN_FRESHNESS:
-            return None
-        if me.good_fruit < config.HARASS_MIN_GOOD_FRUIT:
-            return None
-        # 已设卡或节点已有我方关卡则跳过
-        ns = world.node(node)
-        if ns is None:
-            return None
-        if ns.active_guard_owner() == me.team_id:
-            return None
-        # 只能在必经节点(chokepoint)或前方路径关键节点设卡
-        if not self._is_guard_worthy_node(gm, node, terminal):
-            return None
-        # 计算防守值: 坏果×3 + 好果×2
-        g = min(config.GUARD_ATTACK_RESERVE, me.good_fruit - config.KEEP_GOOD_FRUIT_MIN)
-        b = min(config.GUARD_ATTACK_RESERVE, me.bad_fruit)
-        if g < 0:
-            g = 0
-        if b < 0:
-            b = 0
-        defense = g * 2 + b * 3
-        if defense < config.GUARD_DEFENSE_DEFAULT:
-            return None
-        return actions.set_guard(node, good_fruit=g, bad_fruit=b)
-
-    def _is_guard_worthy_node(self, gm, node, terminal):
-        """判断节点是否值得设卡: chokepoint 或对手路径上的必经节点。"""
-        if node in getattr(gm, 'chokepoints', set()):
-            return True
-        # 节点在通往终点的必经之路上
-        if terminal:
-            path, _ = gm.time_optimal_path(node, terminal)
-            if path and len(path) >= 2:
-                # 单一路径上的节点 = 对手也必经
-                return True
-        return False
-
-    # ================================================================
-    #  窗口出牌 v5: 激进博弈
-    # ================================================================
-
     def _window_card(self, world, me):
-        """v5: 激进窗口博弈。优先XIAN_GONG抢攻，其次YAN_DIE消耗对手资源。"""
         contests = world.my_contests()
         if not contests:
             return None
@@ -734,8 +676,7 @@ class DecisionEngine:
         available = []
         if (me.guard_action_point or 0) > 0:
             available.append(Card.BING_ZHENG)
-        # v5: 降低 XIAN_GONG 门槛 (freshness ≥ 75 不再要求 80)
-        if me.freshness >= 75 and me.good_fruit > config.KEEP_GOOD_FRUIT_MIN:
+        if me.freshness >= 80 and me.good_fruit > config.KEEP_GOOD_FRUIT_MIN:
             available.append(Card.XIAN_GONG)
         if me.resource_count(ResourceType.PASS_TOKEN) > 0 \
                 or me.resource_count(ResourceType.OFFICIAL_PERMIT) > 0:
@@ -744,8 +685,7 @@ class DecisionEngine:
             available.append(Card.QIANG_XING)
         if not available:
             return actions.window_card(cid, Card.ABSTAIN)
-        # v5: 优先级 XIAN_GONG > YAN_DIE > QIANG_XING > BING_ZHENG（进攻优先）
-        for card in [Card.XIAN_GONG, Card.YAN_DIE, Card.QIANG_XING, Card.BING_ZHENG]:
+        for card in [Card.BING_ZHENG, Card.XIAN_GONG, Card.YAN_DIE, Card.QIANG_XING]:
             if card in available:
                 return actions.window_card(cid, card)
         return actions.window_card(cid, Card.ABSTAIN)
@@ -755,14 +695,14 @@ class DecisionEngine:
     # ================================================================
 
     def _maybe_squad_v3(self, world, me, gm, node, terminal):
-        """v5 小分队：优先清障 → 骚扰对手 → 探路宫门。"""
+        """v3 小分队：优先清障、其次探路宫门。"""
         if world.is_rush:
             return None
         avail = me.squad_available or 0
         if avail <= 0:
             return None
 
-        # 优先 SQUAD_CLEAR 前方障碍（≥2队）
+        # v3: 优先 SQUAD_CLEAR 前方障碍
         if avail >= 2:
             obstacle_ahead = self._find_obstacle_ahead(world, gm, node, terminal)
             if obstacle_ahead:
@@ -770,15 +710,6 @@ class DecisionEngine:
                 if key not in self._squad_sent:
                     self._squad_sent.add(key)
                     return actions.squad_clear(obstacle_ahead)
-
-        # v5: SQUAD_DISPATCH 骚扰对手前方节点（≥2队，消耗对手资源）
-        if config.SQUAD_HARASS_ENABLED and avail >= 2:
-            harass_target = self._find_harass_target(world, me, gm, node, terminal)
-            if harass_target:
-                key = (harass_target, "harass")
-                if key not in self._squad_sent:
-                    self._squad_sent.add(key)
-                    return actions.squad_dispatch(harass_target)
 
         # 探路宫门
         if avail >= 1:
@@ -801,35 +732,6 @@ class DecisionEngine:
             ns = world.node(nid)
             if ns and ns.has_obstacle:
                 return nid
-        return None
-
-    def _find_harass_target(self, world, me, gm, node, terminal):
-        """v5: 寻找对手路径上的节点作为骚扰目标。
-
-        优先选择对手当前位置前方 2-5 跳的节点，派遣小分队拖延对手。
-        """
-        if not terminal or not config.SQUAD_HARASS_ENABLED:
-            return None
-        opp = world.opponent
-        if opp is None:
-            return None
-        opp_node = opp.current_node_id
-        if not opp_node:
-            return None
-        opp_path, _ = gm.time_optimal_path(opp_node, terminal)
-        if not opp_path or len(opp_path) < 3:
-            return None
-        for i in range(
-                min(config.SQUAD_AHEAD_MIN_HOPS, len(opp_path) - 1),
-                min(config.SQUAD_HARASS_RANGE, len(opp_path))):
-            target = opp_path[i]
-            dist = gm.route_distance(node, target)
-            if dist == _INF or dist > config.SQUAD_HARASS_RANGE * 15:
-                continue
-            ns = world.node(target)
-            if ns and ns.active_guard_owner() == me.team_id:
-                continue
-            return target
         return None
 
     def _maybe_scout_gate(self, world, me, gm, node):
