@@ -445,12 +445,11 @@ class DecisionEngine:
     # ================================================================
 
     def _advance(self, world, me, gm, src, dst, terminal):
-        """v4.1: 时间预算 + 鲜度感知路由。
+        """v4.3: 动态路由 — 鲜度 + 对手位置 + 时间预算综合决策。
 
-        1. 计算时间最优路径帧数
-        2. 若剩余帧数充裕（超出最快路径 50+ 帧），寻找鲜度更优路径
-        3. 鲜度路径必须能在预算内到达，否则退回最快路径
-        4. 天气有害时优先绕行保护鲜度
+        1. 计算多条候选路径（时间最优 / 鲜度最优 / 天气调整）
+        2. 根据对手位置和路径动态调整 blocked 节点
+        3. 综合评分选最优路径：帧数 + 鲜度损耗 + 对抗风险
         """
         blocked = self._blocked_nodes(world, me)
         active_wt = world.active_weather_type()
@@ -458,46 +457,101 @@ class DecisionEngine:
         current_round = world.round or 0
         duration = self.ctx.duration_round or 600
 
-        # 时间最优路径（基准）
-        path_b, cost_b = gm.time_optimal_path(src, dst, blocked=blocked)
-        path_u, cost_u = gm.time_optimal_path(src, dst)
+        # ── 对手感知阻塞 ──
+        # 对手在前方路径节点上 → 提前避开
+        opp_blocked = self._opponent_blocked_nodes(world, gm, src, terminal)
+        all_blocked = blocked | opp_blocked
 
-        # ── v4.2: 时间预算 + 动态鲜度路由 ──
-        # 剩余可用的总帧数 = 回合上限 - 当前回合 - 安全余量
+        # ── 候选路径 ──
+        # 路径1: 时间最优（阻塞感知）
+        path_time, cost_time = gm.time_optimal_path(src, dst, blocked=all_blocked)
+        # 路径2: 时间最优（无阻塞基准）
+        path_base, cost_base = gm.time_optimal_path(src, dst)
+        # 路径3: 时间最优（仅障碍/守卫阻塞）
+        path_safe, cost_safe = gm.time_optimal_path(src, dst, blocked=blocked)
+
+        # ── 动态鲜度权重 ──
         remaining_budget = duration - current_round - config.DELIVER_TIME_MARGIN
+        # 鲜度越低 → 越需要保护 → 权重越大
+        freshness_urgency = max(0, (100 - me.freshness) / 30.0)
+        # 时间越充裕 → 权重越大
+        if cost_base > 0 and remaining_budget > cost_base:
+            time_slack = (remaining_budget - cost_base) / max(1, cost_base)
+        else:
+            time_slack = 0
+        # 天气加剧鲜度损耗 → 权重加大
+        weather_bonus = 1.0 if active_wt in ("HOT", "MOUNTAIN_FOG") else 0
+        fw = min(4.0, max(0.3, freshness_urgency + time_slack * 2 + weather_bonus))
 
-        # 时间充裕时使用鲜度+时间平衡路由（GameMap 原生支持）
-        if path_u and len(path_u) > 1 and remaining_budget > cost_u + 50:
-            # freshness_weight 控制鲜度偏好强度（越高越倾向低损耗路线）
-            # 时间越充裕 → 权重越大 → 更倾向鲜度路线
-            slack = remaining_budget - cost_u
-            fw = min(3.0, max(0.5, slack / 100.0))
-            fresh_path, _ = gm.freshness_optimal_path(
-                src, dst, blocked=blocked, freshness_weight=fw)
-            if fresh_path and len(fresh_path) > 1:
-                _, fresh_cost = gm.time_optimal_path(
-                    src, dst, blocked=blocked)
-                if fresh_cost <= remaining_budget and fresh_cost - cost_u <= 60:
-                    path_b = fresh_path
-                    cost_b = fresh_cost
-                    path_u, cost_u = gm.time_optimal_path(src, dst)
+        # ── 路径4: 鲜度+时间平衡 ──
+        path_fresh = None
+        cost_fresh = _INF
+        if path_safe and len(path_safe) > 1:
+            try:
+                path_fresh, _ = gm.freshness_optimal_path(
+                    src, dst, blocked=all_blocked, freshness_weight=fw)
+                if path_fresh and len(path_fresh) > 1:
+                    _, cost_fresh = gm.time_optimal_path(
+                        src, dst, blocked=all_blocked)
+            except Exception:
+                path_fresh = None
 
-        # ── 天气路由 ──
-        weather_hurts_direct = self._weather_hurts_path(active_wt, gm, path_u)
-        if weather_hurts_direct:
-            path_w, cost_w = gm.weather_adjusted_path(
-                src, dst, weather_type=active_wt, blocked=blocked)
-            if path_w and len(path_w) > 1:
-                if cost_w - cost_u <= 40:
-                    path_b, cost_b = path_w, cost_w
+        # ── 天气调整路径 ──
+        path_weather = None
+        cost_weather = _INF
+        if active_wt and self._weather_hurts_path(active_wt, gm, path_safe or path_base):
+            path_weather, cost_weather = gm.weather_adjusted_path(
+                src, dst, weather_type=active_wt, blocked=all_blocked)
 
-        # 酷暑/山雾预告→倾向官道（鲜度安全）
-        if upcoming and upcoming.get("type") in ("HOT", "MOUNTAIN_FOG"):
+        # ── 路径评分与选择 ──
+        FRESH_RATE = {"ROAD": 0.055, "WATER": 0.045, "MOUNTAIN": 0.07, "BRANCH": 0.065}
+        candidates = []
+
+        for label, path, cost in [
+            ("time", path_time, cost_time),
+            ("safe", path_safe, cost_safe),
+            ("fresh", path_fresh, cost_fresh),
+            ("weather", path_weather, cost_weather),
+        ]:
+            if not path or len(path) < 2 or cost == _INF:
+                continue
+            if cost > remaining_budget:
+                continue  # 不能在预算内到达 → 排除
+
+            # 计算鲜度损耗
+            types = self._path_route_types(gm, path)
+            avg_loss = sum(FRESH_RATE.get(t, 0.06) for t in types) / max(1, len(types))
+            est_freshness_loss = cost * avg_loss
+
+            # 对手风险：路径与对手路径重叠的节点数
+            opp_risk = self._opponent_path_overlap(gm, path, world)
+
+            # 综合评分（越低越好）
+            score = cost + est_freshness_loss * 10 + opp_risk * 30
+            candidates.append((score, path, cost, label))
+
+        # 选评分最低的路径
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            _, best_path, best_cost, best_label = candidates[0]
+            path_b = best_path
+            cost_b = best_cost
+            path_u = path_base  # 用于后续判断
+            cost_u = cost_base
+        else:
+            # 所有候选都超预算 → 退回时间最优
+            path_b = path_time or path_safe
+            cost_b = cost_time if cost_time != _INF else (cost_safe if cost_safe != _INF else 0)
+            path_u = path_base
+            cost_u = cost_base
+
+        # ── 酷暑/山雾预告 → 倾向官道 ──
+        if upcoming and upcoming.get("type") in ("HOT", "MOUNTAIN_FOG") and path_u:
             u_types = self._path_route_types(gm, path_u)
             u_mtn = sum(1 for t in u_types if t == "MOUNTAIN") / max(1, len(u_types))
             if u_mtn > 0.3:
                 alt_path, alt_cost = gm.weather_adjusted_path(
-                    src, dst, weather_type=upcoming.get("type"), blocked=blocked)
+                    src, dst, weather_type=upcoming.get("type"), blocked=all_blocked)
                 if alt_path and len(alt_path) > 1 and alt_cost - cost_u < 40:
                     a_types = self._path_route_types(gm, alt_path)
                     a_mtn = sum(1 for t in a_types if t == "MOUNTAIN") / max(1, len(a_types))
@@ -505,30 +559,73 @@ class DecisionEngine:
                         path_b, cost_b = alt_path, alt_cost
 
         # ── 执行移动 ──
-        if path_b and len(path_b) > 1 and path_u and len(path_u) > 1:
-            nxt_u = path_u[1]
-            ns = world.node(nxt_u)
+        if path_b and len(path_b) > 1:
+            nxt = path_b[1]
+            ns = world.node(nxt)
 
             # 障碍处理
-            if ns and ns.has_obstacle and not self._is_cooldown(world, nxt_u):
-                detour_extra = cost_b - cost_u
+            if ns and ns.has_obstacle and not self._is_cooldown(world, nxt):
+                alt_path, alt_cost = gm.time_optimal_path(
+                    src, dst, blocked=all_blocked | {nxt})
+                detour_extra = (alt_cost - cost_b) if alt_cost != _INF else _INF
                 if detour_extra <= self._obstacle_detour_budget:
-                    return [actions.move(path_b[1])]
+                    return [actions.move(alt_path[1])]
                 if me.good_fruit > config.KEEP_GOOD_FRUIT_MIN:
-                    t04 = self._find_t04(world, nxt_u)
+                    t04 = self._find_t04(world, nxt)
                     if t04:
                         return [actions.claim_task(t04.get("taskId"))]
-                    return [actions.clear_obstacle(nxt_u)]
-                return [actions.move(path_b[1])]
+                    return [actions.clear_obstacle(nxt)]
+                return [actions.move(alt_path[1] if alt_path else path_b[1])]
 
             speed = self._rush_speed_warranted(world, me, gm, src, terminal)
             if speed:
                 return [speed]
-            return [actions.move(path_b[1])]
+            return [actions.move(nxt)]
 
         if not path_u or len(path_u) < 2:
             return []
         return self._breakthrough(world, me, gm, path_u[1], terminal)
+
+    def _opponent_blocked_nodes(self, world, gm, src, terminal):
+        """v4.3: 对手感知阻塞。对手前方路径上的节点标记为需避开。"""
+        blocked = set()
+        opp = world.opponent
+        if opp is None or opp.current_node_id is None:
+            return blocked
+        opp_node = opp.current_node_id
+        # 对手到终点的路径
+        opp_path, _ = gm.time_optimal_path(opp_node, terminal)
+        if not opp_path:
+            return blocked
+        # 对手前方 0-2 跳标记（对手可能在这些节点设卡或到达）
+        opp_idx = -1
+        for i, nid in enumerate(opp_path):
+            if nid == opp_node:
+                opp_idx = i
+                break
+        if opp_idx >= 0:
+            for j in range(opp_idx, min(opp_idx + 3, len(opp_path))):
+                nid = opp_path[j]
+                ns = world.node(nid)
+                # 对手在此有守卫 → 避开
+                if ns and ns.active_guard_owner() and ns.active_guard_owner() != world.me.team_id:
+                    blocked.add(nid)
+        return blocked
+
+    def _opponent_path_overlap(self, gm, my_path, world):
+        """v4.3: 计算路径与对手路径的重叠节点数（越高越不利）。"""
+        opp = world.opponent
+        if opp is None or opp.current_node_id is None:
+            return 0
+        terminal = (gm.terminal_nodes or [None])[0]
+        if not terminal:
+            return 0
+        opp_path, _ = gm.time_optimal_path(opp.current_node_id, terminal)
+        if not opp_path or not my_path:
+            return 0
+        my_set = set(my_path)
+        opp_set = set(opp_path)
+        return len(my_set & opp_set)
 
     def _freshness_optimal_path(self, gm, src, dst):
         """v4-fix: 返回预估总鲜度损耗最低的路径。
