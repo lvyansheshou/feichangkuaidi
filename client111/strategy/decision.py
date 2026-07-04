@@ -85,36 +85,27 @@ class DecisionEngine:
             if me.delivered or me.state == PlayerState.DELIVERED:
                 return result
 
-            # v4.5fix: 未处理的站点优先处理，跳过非关键窗口博弈
-            need_process = (node in gm.process_nodes and not self._processed_here)
-            card = self._window_card(world, me)
-            if card and card.get("card") != Card.ABSTAIN:
-                # 仅在非处理站点或高筹码博弈时才出牌
-                if not need_process or self._stakes_high(card, world):
-                    result = [card]
-                    return result
-                # 处理站点 + 低筹码博弈 → 弃权，优先处理
-
+            # v4.5fix: 主车队动作（demo模式：与窗口牌同帧提交，互不挤占）
+            main = []
             if me.state in (PlayerState.MOVING, PlayerState.WAITING):
                 horse = self._maybe_horse(me, gm, terminal)
                 if horse:
-                    # v4.5fix: 用马同时续发MOVE，省一帧（demo _keep_moving模式）
+                    main = [horse]
                     if me.next_node_id:
-                        return [horse, actions.move(me.next_node_id)]
-                    return [horse]
-                # MOVING: re-issue MOVE to next_node_id for continuous progress
-                if me.state == PlayerState.MOVING:
+                        main.append(actions.move(me.next_node_id))
+                elif me.state == PlayerState.MOVING:
                     if me.next_node_id:
-                        return [actions.move(me.next_node_id)]
-                    return result
-                # WAITING: fall through to _plan() — don't stay idle
-
-            if me.state not in _IDLE_LIKE:
-                return result
-
-            main = self._plan(world, me, gm, node, terminal, gate)
-            squad = self._maybe_squad_v3(world, me, gm, node, terminal)
-            result = main + ([squad] if squad else [])
+                        main = [actions.move(me.next_node_id)]
+                # WAITING: fall through to _plan()
+            if me.state in _IDLE_LIKE or (me.state == PlayerState.WAITING and not main):
+                main = self._plan(world, me, gm, node, terminal, gate)
+            # 窗口出牌：与主车队同帧提交
+            card = self._window_card(world, me)
+            # 小分队：同帧提交
+            squad = None
+            if me.state in _IDLE_LIKE or me.state in (PlayerState.MOVING, PlayerState.WAITING):
+                squad = self._maybe_squad_v3(world, me, gm, node, terminal)
+            result = list(main) + ([card] if card else []) + ([squad] if squad else [])
             return result
         finally:
             self._prev_state = me.state
