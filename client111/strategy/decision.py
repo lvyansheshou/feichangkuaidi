@@ -246,7 +246,7 @@ class DecisionEngine:
         """v4.2: RUSH 立即护果。鲜度 < 98 且 > 30 即用。"""
         if not world.is_rush or me.delivered or (me.rush_tactic_used_count or 0) > 0:
             return None
-        if me.freshness < config.RUSH_PROTECT_BELOW and me.freshness > 30:
+        if me.freshness < config.RUSH_PROTECT_FRESHNESS_BELOW and me.freshness > 30:
             return actions.rush_protect()
         return None
 
@@ -255,7 +255,7 @@ class DecisionEngine:
             return None
         if me.good_fruit < config.KEEP_GOOD_FRUIT_MIN + 2:
             return None
-        if me.freshness < config.RUSH_PROTECT_BELOW:
+        if me.freshness < config.RUSH_PROTECT_FRESHNESS_BELOW:
             return None
         if self._has_any_horse(me) or not self._far_from_terminal(gm, node, terminal):
             return None
@@ -328,7 +328,7 @@ class DecisionEngine:
         return None
 
     def _find_ice_on_route(self, world, me, gm, node, terminal):
-        """v4.4: 激进冰鉴探测。沿路径搜索 config.ICE_BOX_DETOUR_RANGE 跳。
+        """v4.4: 激进冰鉴探测。沿路径搜索 config.ICE_BOX_DETOUR_KEEP 跳。
 
         对方用了 2+ 次冰鉴才保 88 鲜度。我方必须确保充足冰鉴。
         """
@@ -339,7 +339,7 @@ class DecisionEngine:
         path, _ = gm.time_optimal_path(node, terminal)
         if not path or len(path) < 2:
             return None
-        max_range = min(config.ICE_BOX_DETOUR_RANGE, len(path))
+        max_range = min(config.ICE_BOX_DETOUR_KEEP, len(path))
         for i in range(1, max_range):
             nid = path[i]
             ns = world.node(nid)
@@ -573,7 +573,7 @@ class DecisionEngine:
         path_safe, cost_safe = gm.time_optimal_path(src, dst, blocked=blocked)
 
         # ── 动态鲜度权重（v4.4: 对齐对方策略，目标鲜度 88%）──
-        remaining_budget = duration - current_round - config.DELIVER_TIME_MARGIN
+        remaining_budget = duration - current_round - config.DELIVER_TIME_SAFETY_MARGIN
         # 鲜度距目标越远 → 越急迫地选低损耗路线
         freshness_urgency = max(1.5, (100 - me.freshness) / 15.0)
         # 时间越充裕 → 权重越大（对方 r561 到达，我们接受 r560）
