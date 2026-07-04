@@ -198,6 +198,12 @@ class DecisionEngine:
         if route_dst == gate:
             return self._advance(world, me, gm, node, gate, terminal)
 
+        # v4.5fix: S01 智能选路 — 评估山路vs官道的总收益
+        if node == 'S01' and terminal:
+            best_route = self._pick_best_initial_route(world, me, gm, terminal)
+            if best_route and best_route != terminal:
+                return self._advance(world, me, gm, node, best_route, terminal)
+
         # v4.5: 绕路领冰鉴（鲜度优先）→ 绕路做任务
         dst = (self._ice_box_detour_target(world, me, gm, node, terminal)
                or self._task_detour_target(world, me, gm, node, terminal)
@@ -517,6 +523,59 @@ class DecisionEngine:
         """v4.5: 任务分是否已达 180 封顶。"""
         base = me.task_score or 0
         return base + r.milestone_bonus(base) >= 180
+
+    def _pick_best_initial_route(self, world, me, gm, terminal):
+        """v4.5fix: S01 智能选路。对比山路和官道的预期总收益。
+
+        山路: S01→S06→S08→S10 (快，独占S06冰鉴，但鲜度损耗高)
+        官道: S01→S02→S03→S07→S09→S10 (慢，共享冰鉴，鲜度损耗低)
+
+        决策因素: 冰鉴独占性 > 鲜度损耗 > 时间成本
+        """
+        if not terminal:
+            return None
+        # 找山路和官道的分歧点
+        neighbors = gm.neighbors('S01')
+        mountain_next = 'S06' if 'S06' in neighbors else None
+        road_next = 'S02' if 'S02' in neighbors else None
+        if not mountain_next or not road_next:
+            return None
+
+        # 山路评估
+        mtn_path, mtn_cost = self._time_path(world, 'S01', terminal)  # already freshness-weighted
+        mtn_loss = self._path_freshness_loss(world, mtn_path) if mtn_path else 999
+        mtn_ice = 0
+        for nid in (mtn_path or []):
+            ns = world.node(nid)
+            if ns and ns.resource_available(ResourceType.ICE_BOX):
+                mtn_ice += 1
+
+        # 官道评估
+        # 临时走 S02 方向计算
+        road_path, road_cost = gm.time_optimal_path('S01', terminal)  # unweighted baseline
+        if road_path and 'S02' in road_path[:3]:
+            road_loss = self._path_freshness_loss(world, road_path)
+            road_ice = 0
+            opp = world.opponent
+            opp_path = None
+            if opp and opp.current_node_id:
+                opp_path, _ = self._time_path(world, opp.current_node_id, terminal)
+            for nid in road_path:
+                ns = world.node(nid)
+                if ns and ns.resource_available(ResourceType.ICE_BOX):
+                    # 对手也经过 → 可能被抢
+                    if opp_path and nid in opp_path:
+                        road_ice += 0.3  # 30%概率抢到
+                    else:
+                        road_ice += 1
+        else:
+            road_loss, road_ice, road_cost = 999, 0, 999
+
+        # 综合评分: 冰鉴(+10)×个数 − 鲜度损耗 − 时间惩罚
+        mtn_score = mtn_ice * 10 - mtn_loss
+        road_score = road_ice * 10 - road_loss
+
+        return mountain_next if mtn_score >= road_score else road_next
 
     def _late_route_target(self, world, me, gate, terminal):
         """v4.5: r360后未验核→直奔宫门（demo RUSH_PREPOSITION_ROUND）。"""
