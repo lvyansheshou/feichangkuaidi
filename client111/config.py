@@ -45,17 +45,26 @@ DELIVER_TIME_MARGIN = 15         # 交付时间安全余量（帧）
 SKIP_TASK_TEMPLATES = ("T04", "T06")  # 跳过：T04 需障碍上下文，T06 需消耗马
 TASK_DETOUR_MAX_EXTRA = 35       # 绕路做任务最大额外帧（降低：鲜度损失 > 任务收益）
 
-# 对抗
-KEEP_GOOD_FRUIT_MIN = 2          # 攻坚/清障后最低好果（提高保护）
-GATE_SCOUT_MIN_FRAMES = 8        # 小分队探路宫门最小剩余帧
-GATE_SCOUT_MAX_FRAMES = 40       # 最大剩余帧
-INTEL_RANGE = 15                 # 情报射程上限（累计路线距离）
+# ---- 对抗 v5: 激进进攻 ----
+ENABLE_OFFENSIVE = True          # 主动设卡开关（v5: 开启）
+KEEP_GOOD_FRUIT_MIN = 1          # 攻坚/清障/设卡后最低好果（v5: 降为1，允许更多进攻）
+SET_GUARD_ON_CHOKEPOINT = True   # 在必经节点主动设卡
+GUARD_DEFENSE_DEFAULT = 4        # 默认设卡防御值（1好果+1坏果+破关令 = 2+3+3=8，保底4）
+GUARD_ATTACK_RESERVE = 1         # 攻坚时至少保留的坏果数
+SQUAD_HARASS_ENABLED = True      # 启用小分队骚扰对手
+SQUAD_HARASS_RANGE = 5           # 小分队骚扰范围（跳数）
+HARASS_MIN_FRESHNESS = 75.0      # 鲜度低于此不主动设卡（保底优先）
+HARASS_MIN_GOOD_FRUIT = 3        # 好果低于此不主动设卡
 REROUTE_VS_CLEAR_EXTRA = 20      # 绕行多出此帧数改清障
 SQUAD_AHEAD_MIN_HOPS = 2         # 小分队预清障最小跳跃数
 REJECT_BLOCK_ROUNDS = 4          # 拒绝反馈拉黑帧数
-ENABLE_OFFENSIVE = False         # 主动设卡开关（delivery-first，默认关）
 FP_RETRY_LIMIT = 4               # FORCED_PASS 连续失败上限
 FP_RETRY_COOLDOWN = 30           # FORCED_PASS 冷却帧数
+
+# 窗口博弈
+GATE_SCOUT_MIN_FRAMES = 8        # 小分队探路宫门最小剩余帧
+GATE_SCOUT_MAX_FRAMES = 40       # 最大剩余帧
+INTEL_RANGE = 15                 # 情报射程上限（累计路线距离）
 
 # 鲜度感知路由：优先选择鲜度损耗低的路线，即使帧数稍多
 FRESHNESS_FIRST_MAX_EXTRA = 25   # 换低鲜度损耗路线最多额外帧数
