@@ -62,8 +62,10 @@ class DecisionEngine:
         self._completed_task_ids = set()
         self._task_attempted = set()    # v4.3: 已尝试过的任务（防重试风暴）
         self._task_fail_count = {}      # v4.3: 任务失败计数
-        self._claim_attempted = set()   # v4.5fix: 已尝试领取的资源(节点,类型)（防重试风暴）
+        self._claim_attempted = set()   # v4.5fix: 已尝试领取的资源(节点,类型)
         self._claim_fail_count = {}     # v4.5fix: 资源领取失败计数
+        self._guard_break_attempts = {} # v4.5fix: 攻坚尝试次数(node->count)
+        self._used_resource_round = {}  # v4.5fix: 上次USE_RESOURCE的回合(resourceType->round)
         self._obstacle_detour_budget = 25  # v4.2: 绕行≤25帧就绕，省好果优先
 
     # ================================================================
@@ -91,7 +93,7 @@ class DecisionEngine:
             # v4.5fix: 主车队动作（demo模式：与窗口牌同帧提交，互不挤占）
             main = []
             if me.state in (PlayerState.MOVING, PlayerState.WAITING):
-                horse = self._maybe_horse(me, gm, terminal)
+                horse = self._maybe_horse(me, gm, terminal, world)
                 if horse:
                     main = [horse]
                     if me.next_node_id:
@@ -245,12 +247,18 @@ class DecisionEngine:
         """
         if me.resource_count(ResourceType.ICE_BOX) <= 0:
             return None
+        # v4.5fix: 防重复使用（等鲜度变化生效）
+        rnd = world.round or 0
+        last_ice = self._used_resource_round.get(ResourceType.ICE_BOX, -99)
+        if rnd - last_ice < 3:
+            return None
         f = me.freshness
         if 0 < f <= config.ICE_BOX_CAP_AVOID:
+            self._used_resource_round[ResourceType.ICE_BOX] = rnd
             return actions.use_resource(ResourceType.ICE_BOX)
         return None
 
-    def _maybe_horse(self, me, gm, terminal):
+    def _maybe_horse(self, me, gm, terminal, world=None):
         if self._has_move_buff(me):
             return None
         horse = None
@@ -263,12 +271,20 @@ class DecisionEngine:
         dist = gm.route_distance(me.current_node_id, terminal)
         if dist == _INF or dist <= config.HORSE_MIN_REMAINING_DISTANCE:
             return None
+        # v4.5fix: 防重复使用同一资源（等buff生效）
+        rnd = (world.round or 0) if world else 0
+        last_use = self._used_resource_round.get(horse, -99)
+        if rnd - last_use < 3:
+            return None
+        self._used_resource_round[horse] = rnd
         return actions.use_resource(horse)
 
     def _maybe_rush_protect(self, world, me):
-        """v4.2: RUSH 立即护果。鲜度 < 98 且 > 30 即用。"""
-        if not world.is_rush or me.delivered or (me.rush_tactic_used_count or 0) > 0:
+        """v4.5fix: 护果令去重。已用过不再发。"""
+        if not world.is_rush or me.delivered:
             return None
+        if (me.rush_tactic_used_count or 0) > 0:
+            return None  # 已用过，不重发
         if me.freshness < config.RUSH_PROTECT_FRESHNESS_BELOW and me.freshness > 30:
             return actions.rush_protect()
         return None
@@ -848,20 +864,25 @@ class DecisionEngine:
 
         owner = ns.active_guard_owner() if ns else None
         if owner and owner != me.team_id:
+            # v4.5fix: 攻坚次数限制，超限后强制通行
+            gb_attempts = self._guard_break_attempts.get(nxt, 0)
+            if gb_attempts >= 4:
+                self._guard_break_attempts.pop(nxt, None)
+                return [actions.forced_pass(nxt)]
             plan = self._plan_attack(me, ns)
             if plan is not None:
-                self._fp_failures.pop(nxt, None)
                 g, b, bo = plan
-                return [actions.break_guard(nxt, good_fruit=g, bad_fruit=b,
-                                           rush_tactic=(Action.BREAK_ORDER if bo else None))]
-            fails = self._fp_failures.get(nxt, 0)
-            if fails >= config.FP_RETRY_LIMIT:
-                if fails >= config.FP_RETRY_LIMIT + config.FP_RETRY_COOLDOWN:
-                    self._fp_failures.pop(nxt, None)
-                    return [actions.forced_pass(nxt)]
-                self._fp_failures[nxt] = fails + 1
-                return []
-            self._fp_failures[nxt] = fails + 1
+                # 只有攻击力足够时才攻坚
+                defense = (ns.guard or {}).get("defense", 0) or 0
+                atk = g * 2 + b * 3 + (3 if bo else 0)
+                if atk >= defense:
+                    self._guard_break_attempts.pop(nxt, None)
+                    return [actions.break_guard(nxt, good_fruit=g, bad_fruit=b,
+                                               rush_tactic=(Action.BREAK_ORDER if bo else None))]
+                # 攻击力不够 → 记录尝试，强制通行
+                self._guard_break_attempts[nxt] = gb_attempts + 1
+                return [actions.forced_pass(nxt)]
+            # 无法攻坚 → 强制通行
             return [actions.forced_pass(nxt)]
 
         return [actions.move(nxt)]
