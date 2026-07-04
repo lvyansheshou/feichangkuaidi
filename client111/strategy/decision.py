@@ -689,7 +689,7 @@ class DecisionEngine:
             return []
         return self._breakthrough(world, me, gm, path_u[1], terminal)
 
-    # === v4.5: 旧方法保留（不再使用，保留兼容） ===
+    def _opponent_blocked_nodes(self, world, gm, src, terminal):
         """v4.3: 对手感知阻塞。对手前方路径上的节点标记为需避开。"""
         blocked = set()
         opp = world.opponent
