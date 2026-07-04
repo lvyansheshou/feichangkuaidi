@@ -37,9 +37,9 @@ ICE_BOX_LEAD = 7.0                 # （保留兼容）
 ICE_BOX_HOT_USE_BELOW = 88.0       # （保留兼容）
 CLAIM_ICE_BOX_KEEP = 3             # 期望至少持有的冰鉴数
 ICE_BOX_DETOUR_KEEP = 2            # 绕路收集冰鉴的目标持有量（达到即停）
-ICE_BOX_DETOUR_PROJECTED_BELOW = 92.0  # v4.5fix: 投影鲜度<92即绕路领冰鉴（原85过严，第2场0冰鉴）
-ICE_BOX_DETOUR_MAX_EXTRA_FRAMES = 80   # v4.5fix: 放宽绕路预算，冰鉴+10值得多花20帧
-ICE_BOX_DETOUR_NET_MIN = 4.0       # v4.5fix: 净收益≥4即可绕（原6过严，官道路线损耗低时仍可绕）
+ICE_BOX_DETOUR_PROJECTED_BELOW = 88.0  # v4.5fix2: 投影鲜度<88绕路领冰鉴（平衡版：85太严/92太松）
+ICE_BOX_DETOUR_MAX_EXTRA_FRAMES = 60   # v4.5fix2: 对齐demo默认值
+ICE_BOX_DETOUR_NET_MIN = 6.0       # v4.5fix2: 对齐demo默认值，排除山路绕路
 
 # -- 马 --
 HORSE_MIN_REMAINING_DISTANCE = 30

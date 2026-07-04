@@ -90,10 +90,14 @@ class DecisionEngine:
             if me.state in (PlayerState.MOVING, PlayerState.WAITING):
                 horse = self._maybe_horse(me, gm, terminal)
                 if horse:
-                    result = [horse]
-                    return result
-                # MOVING: nothing to do but wait for arrival
+                    # v4.5fix: 用马同时续发MOVE，省一帧（demo _keep_moving模式）
+                    if me.next_node_id:
+                        return [horse, actions.move(me.next_node_id)]
+                    return [horse]
+                # MOVING: re-issue MOVE to next_node_id for continuous progress
                 if me.state == PlayerState.MOVING:
+                    if me.next_node_id:
+                        return [actions.move(me.next_node_id)]
                     return result
                 # WAITING: fall through to _plan() — don't stay idle
 
@@ -241,7 +245,7 @@ class DecisionEngine:
         if not horse or not terminal or not me.current_node_id:
             return None
         dist = gm.route_distance(me.current_node_id, terminal)
-        if dist == _INF or dist < 60:
+        if dist == _INF or dist <= config.HORSE_MIN_REMAINING_DISTANCE:
             return None
         return actions.use_resource(horse)
 
@@ -330,29 +334,6 @@ class DecisionEngine:
                 return actions.claim_resource(node, ResourceType.INTEL)
         return None
 
-    def _find_ice_on_route(self, world, me, gm, node, terminal):
-        """v4.4: 激进冰鉴探测。沿路径搜索 config.ICE_BOX_DETOUR_KEEP 跳。
-
-        对方用了 2+ 次冰鉴才保 88 鲜度。我方必须确保充足冰鉴。
-        """
-        if me.resource_count(ResourceType.ICE_BOX) >= config.CLAIM_ICE_BOX_KEEP:
-            return None
-        if not terminal:
-            return None
-        path, _ = gm.time_optimal_path(node, terminal)
-        if not path or len(path) < 2:
-            return None
-        max_range = min(config.ICE_BOX_DETOUR_KEEP, len(path))
-        for i in range(1, max_range):
-            nid = path[i]
-            ns = world.node(nid)
-            if ns and ns.resource_available(ResourceType.ICE_BOX):
-                if nid == path[1]:
-                    return None  # 下一跳到达时自然领
-                if self._can_afford(world, gm, node, 4, terminal):
-                    return actions.claim_resource(nid, ResourceType.ICE_BOX)
-        return None
-
     # ================================================================
     #  情报 / 绕路做任务（不变）
     # ================================================================
@@ -398,11 +379,9 @@ class DecisionEngine:
 
     def _task_detour_target(self, world, me, gm, node, terminal):
         """v4.5: 任务绕路 — 封顶检测 + 鲜度地板 + 慷慨预算70帧（demo参数）。"""
-        self._track_task_completion(world)
         if self._task_score_capped(me) or not terminal:
             return None
-        base = self._task_base or me.task_score or 0
-        if base >= config.TASK_SEEK_TARGET:
+        if (me.task_score or 0) >= config.TASK_SEEK_TARGET:
             return None
         pid = self.ctx.player_id
         _, direct = self._time_path(world, node, terminal)
@@ -612,7 +591,6 @@ class DecisionEngine:
                 src, dst, weather_type=active_wt, blocked=all_blocked)
 
         # ── 路径评分与选择 ──
-        FRESH_RATE = {"ROAD": 0.055, "WATER": 0.045, "MOUNTAIN": 0.07, "BRANCH": 0.065}
         candidates = []
 
         for label, path, cost in [
@@ -628,7 +606,7 @@ class DecisionEngine:
 
             # 计算鲜度损耗
             types = self._path_route_types(gm, path)
-            avg_loss = sum(FRESH_RATE.get(t, 0.06) for t in types) / max(1, len(types))
+            avg_loss = sum(r.route_freshness_loss(t) for t in types) / max(1, len(types))
             est_freshness_loss = cost * avg_loss
 
             # 对手风险：路径与对手路径重叠的节点数
@@ -1185,6 +1163,16 @@ class DecisionEngine:
                            and me.state != PlayerState.PROCESSING)
         if self._saw_process_complete(world) or transition_done:
             self._processed_here = True
+        # v4.5fix: 追踪鲜度阈值穿越
+        self._track_freshness(me)
+
+    def _track_freshness(self, me):
+        """v4.5fix: 追踪已触发的好果转坏阈值。"""
+        if self._prev_freshness is not None and me.freshness > 0:
+            for t in r.GOOD_TO_BAD_THRESHOLDS:
+                if t not in self._triggered and self._prev_freshness >= t > me.freshness:
+                    self._triggered.add(t)
+        self._prev_freshness = me.freshness
 
     def _saw_process_complete(self, world):
         pid = self.ctx.player_id
