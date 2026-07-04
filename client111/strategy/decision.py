@@ -62,6 +62,8 @@ class DecisionEngine:
         self._completed_task_ids = set()
         self._task_attempted = set()    # v4.3: 已尝试过的任务（防重试风暴）
         self._task_fail_count = {}      # v4.3: 任务失败计数
+        self._claim_attempted = set()   # v4.5fix: 已尝试领取的资源(节点,类型)（防重试风暴）
+        self._claim_fail_count = {}     # v4.5fix: 资源领取失败计数
         self._obstacle_detour_budget = 25  # v4.2: 绕行≤25帧就绕，省好果优先
 
     # ================================================================
@@ -322,30 +324,41 @@ class DecisionEngine:
         return None
 
     def _maybe_claim_v2(self, world, me, gm, node, terminal):
-        """v4.3: 资源领取 + 前方冰鉴探测。"""
+        """v4.5fix: 资源领取 + 重试限制（防死循环）。"""
         ns = world.node(node)
         if ns is None:
             return None
-        # 冰鉴优先 — 当前节点（v4.5: 豁免时间预算，demo做法）
+        MAX_CLAIM_FAILURES = 3
+        # 冰鉴优先 — 当前节点（豁免时间预算）
+        ice_key = (node, 'ICE_BOX')
         if (me.resource_count(ResourceType.ICE_BOX) < config.CLAIM_ICE_BOX_KEEP
-                and ns.resource_available(ResourceType.ICE_BOX)):
+                and ns.resource_available(ResourceType.ICE_BOX)
+                and self._claim_fail_count.get(ice_key, 0) < MAX_CLAIM_FAILURES
+                and ice_key not in self._claim_attempted):
+            self._claim_attempted.add(ice_key)
             return actions.claim_resource(node, ResourceType.ICE_BOX)
-        # 马——剩余距离>100
+        # 马
         if not self._has_any_horse(me) and terminal and node:
             dist = gm.route_distance(node, terminal)
             if dist != _INF and dist > 100:
-                if ns.resource_available(ResourceType.FAST_HORSE):
-                    if self._can_afford(world, gm, node, 2, terminal):
-                        return actions.claim_resource(node, ResourceType.FAST_HORSE)
-                if ns.resource_available(ResourceType.SHORT_HORSE):
-                    if self._can_afford(world, gm, node, 2, terminal):
-                        return actions.claim_resource(node, ResourceType.SHORT_HORSE)
+                for rt in (ResourceType.FAST_HORSE, ResourceType.SHORT_HORSE):
+                    rkey = (node, rt)
+                    if (ns.resource_available(rt)
+                            and self._claim_fail_count.get(rkey, 0) < MAX_CLAIM_FAILURES
+                            and rkey not in self._claim_attempted
+                            and self._can_afford(world, gm, node, 2, terminal)):
+                        self._claim_attempted.add(rkey)
+                        return actions.claim_resource(node, rt)
         # 情报
+        intel_key = (node, 'INTEL')
         if (me.resource_count(ResourceType.INTEL) < 1
                 and ns.resource_available(ResourceType.INTEL)
-                and self._intel_usable_ahead(world, me, gm, node, terminal)):
-            if self._can_afford(world, gm, node, 2, terminal):
-                return actions.claim_resource(node, ResourceType.INTEL)
+                and self._claim_fail_count.get(intel_key, 0) < MAX_CLAIM_FAILURES
+                and intel_key not in self._claim_attempted
+                and self._intel_usable_ahead(world, me, gm, node, terminal)
+                and self._can_afford(world, gm, node, 2, terminal)):
+            self._claim_attempted.add(intel_key)
+            return actions.claim_resource(node, ResourceType.INTEL)
         return None
 
     # ================================================================
@@ -1186,12 +1199,18 @@ class DecisionEngine:
             tgt = la.get("targetNodeId")
             if tgt:
                 self._cooldown[tgt] = (world.round or 0) + config.REJECT_BLOCK_ROUNDS
-        # v4.3: 任务领取被拒 → 记录失败，避免死循环重试
+        # v4.3: 任务领取被拒 → 记录失败
         if la.get("action") == "CLAIM_TASK":
             tid = la.get("taskId")
             if tid:
                 self._task_fail_count[tid] = self._task_fail_count.get(tid, 0) + 1
                 self._task_attempted.discard(tid)
+        # v4.5fix: 资源领取被拒 → 记录失败
+        if la.get("action") == "CLAIM_RESOURCE":
+            rkey = (la.get("targetNodeId"), la.get("resourceType"))
+            if rkey[0]:
+                self._claim_fail_count[rkey] = self._claim_fail_count.get(rkey, 0) + 1
+                self._claim_attempted.discard(rkey)
 
     def _detect_task_complete(self, world):
         """v4.3: 检测任务完成 → 清除任务跟踪状态。"""
