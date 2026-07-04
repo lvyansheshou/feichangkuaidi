@@ -460,22 +460,8 @@ class DecisionEngine:
         path_b, cost_b = gm.time_optimal_path(src, dst, blocked=blocked)
         path_u, cost_u = gm.time_optimal_path(src, dst)
 
-        # v4: 鲜度感知路由——在无阻塞路径中寻找鲜度最优路径
-        if path_u and len(path_u) > 1 and not world.is_rush:
-            freshness_path = self._freshness_optimal_path(gm, src, dst)
-            if freshness_path and len(freshness_path) > 1:
-                _, fresh_cost = gm.time_optimal_path(src, dst)  # 计算帧数
-                # 遍历 freshness_path 估算帧数
-                fresh_frame_cost = self._estimate_path_frames(gm, freshness_path)
-                if fresh_frame_cost <= cost_u + config.FRESHNESS_FIRST_MAX_EXTRA:
-                    path_u = freshness_path
-                    cost_u = fresh_frame_cost
-                    # 也相应更新阻塞路径
-                    path_b2, cost_b2 = gm.time_optimal_path(src, dst, blocked=blocked)
-                    if cost_b2 - cost_u <= config.FRESHNESS_FIRST_MAX_EXTRA:
-                        path_b, cost_b = path_b2, cost_b2
-
-        # v4: 天气路由——评估鲜度损失而非仅帧数
+        # v4-fix: 鲜度路由仅在天气有害时才启用（避免绕远路）
+        # 天气路由——天气损害直路时寻找替代路径
         weather_hurts_direct = self._weather_hurts_path(active_wt, gm, path_u)
         if weather_hurts_direct:
             path_w, cost_w = gm.weather_adjusted_path(
@@ -525,9 +511,10 @@ class DecisionEngine:
         return self._breakthrough(world, me, gm, path_u[1], terminal)
 
     def _freshness_optimal_path(self, gm, src, dst):
-        """v4: 返回鲜度损耗最低的路径（优先水路 > 官道 > 支路 > 山路）。
+        """v4-fix: 返回预估总鲜度损耗最低的路径。
 
-        复用 GameMap.enumerate_paths 取多条候选，按每帧鲜度损耗排序。
+        总鲜度损耗 = (移动帧数 + 途经节点处理开销) × 加权每帧损耗率。
+        途经节点越多处理开销越大，避免绕远路多停站。
         """
         if not src or not dst:
             return None
@@ -538,31 +525,45 @@ class DecisionEngine:
         if not candidates:
             return None
 
-        best_path, best_loss = None, _INF
+        FRESH_PER_FRAME = {"ROAD": 0.055, "WATER": 0.045, "MOUNTAIN": 0.07, "BRANCH": 0.065}
+        # 每个途经节点额外处理开销（帧）：PROCESS + 可能的窗口博弈
+        NODE_OVERHEAD = 50
+
+        best_path, best_total_loss = None, _INF
         for path, _dist in candidates:
             types = self._path_route_types(gm, path)
             if not types:
                 continue
-            # 计算该路径的加权鲜度损耗（每帧）
-            weighted_loss = sum(
-                {"ROAD": 0.055, "WATER": 0.045, "MOUNTAIN": 0.07, "BRANCH": 0.065}.get(t, 0.06)
-                for t in types
-            ) / len(types)
-            if weighted_loss < best_loss:
-                best_loss = weighted_loss
+            est_move_frames = self._estimate_path_frames(gm, path)
+            if est_move_frames <= 0 or est_move_frames == _INF:
+                continue
+            # 途经节点处理开销（不包括起点和终点）
+            intermediate_nodes = max(0, len(path) - 2)
+            total_frames = est_move_frames + intermediate_nodes * NODE_OVERHEAD
+            # 路径加权每帧损耗率
+            avg_loss_rate = sum(FRESH_PER_FRAME.get(t, 0.06) for t in types) / len(types)
+            total_loss = total_frames * avg_loss_rate
+            if total_loss < best_total_loss:
+                best_total_loss = total_loss
                 best_path = path
         return best_path
 
     def _estimate_path_frames(self, gm, path):
-        """估算给定路径的总帧数。简化：用路线距离 / 1000 近似。"""
+        """估算给定路径的总帧数。使用路线类型对应的每帧移动量。"""
         if not path or len(path) < 2:
             return _INF
-        total = 0
+        # 每帧移动量（基础 1000 + 路线系数调整）
+        ROUTE_COST = {"ROAD": 1380, "WATER": 1250, "MOUNTAIN": 1780, "BRANCH": 1550}
+        total_frames = 0
         for i in range(len(path) - 1):
             edge = gm.edge_between(path[i], path[i + 1])
             if edge:
-                total += edge.distance or 0
-        return int(total * 1.38)  # 近似: 1 distance ≈ 1.38 frames (取 ROAD 系数)
+                dist = edge.distance or 0
+                rt = getattr(edge, 'route_type', 'ROAD') or 'ROAD'
+                move_amount = dist * ROUTE_COST.get(rt, 1380)
+                # 每帧移动 1000，ceil 计算帧数
+                total_frames += int(move_amount / 1000) + (1 if move_amount % 1000 > 0 else 0)
+        return max(total_frames, 1)
 
     def _weather_hurts_path(self, weather_type, gm, path):
         """检查天气是否对给定路径有害。"""
