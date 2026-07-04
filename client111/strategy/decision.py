@@ -91,7 +91,14 @@ class DecisionEngine:
             if me.delivered or me.state == PlayerState.DELIVERED:
                 return result
 
-            # v4.5fix: 主车队动作（demo模式：与窗口牌同帧提交，互不挤占）
+            # v4.5fix: 冰鉴救援 — 任何状态下优先使用（关键资源，不等待_idle）
+            if me.state not in (PlayerState.MOVING,):  # MOVING时只能用马
+                rescue = self._freshness_rescue(world, me)
+                if rescue:
+                    result = [rescue]
+                    return result
+
+            # v4.5fix: 主车队动作（与窗口牌/小分队同帧提交）
             main = []
             if me.state in (PlayerState.MOVING, PlayerState.WAITING):
                 horse = self._maybe_horse(me, gm, terminal, world)
@@ -121,10 +128,7 @@ class DecisionEngine:
     # ================================================================
 
     def _plan(self, world, me, gm, node, terminal, gate):
-        # v4.5: 冰鉴 ≤90 使用
-        rescue = self._freshness_rescue(world, me)
-        if rescue:
-            return [rescue]
+        # 注: 冰鉴救援已移至 decide() 顶层，每帧必检
 
         # S15 终点
         if terminal and node == terminal:
@@ -247,14 +251,8 @@ class DecisionEngine:
         """
         if me.resource_count(ResourceType.ICE_BOX) <= 0:
             return None
-        # v4.5fix: 防重复使用（等鲜度变化生效）
-        rnd = world.round or 0
-        last_ice = self._used_resource_round.get(ResourceType.ICE_BOX, -99)
-        if rnd - last_ice < 3:
-            return None
         f = me.freshness
         if 0 < f <= config.ICE_BOX_CAP_AVOID:
-            self._used_resource_round[ResourceType.ICE_BOX] = rnd
             return actions.use_resource(ResourceType.ICE_BOX)
         return None
 
